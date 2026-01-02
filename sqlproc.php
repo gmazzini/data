@@ -1,5 +1,5 @@
 <?php
-include "local.php"
+include "local.php";
 
 if (!is_dir($cache_dir)) {
   @mkdir($cache_dir, 0775, true);

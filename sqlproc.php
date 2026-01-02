@@ -1,27 +1,6 @@
 <?php
+#include "local.php"
 
-$points = 1000;
-$tab = [
-  [
-    "table" => "temp_rac",
-    "cols"  => ["t"],          // es: ["t","h","p"]
-  ],
-  [
-    "table" => "temp_fgm",
-    "cols"  => ["t"],
-  ],
-  [
-    "table" => "temp_srso",
-    "cols"  => ["t"],
-  ],
-];
-
-$db_host = "127.0.0.1";
-$db_user = "energy";
-$db_pass = "xxxxxx";
-$db_name = "energy";
-
-$cache_dir = "tmp";
 if (!is_dir($cache_dir)) {
   @mkdir($cache_dir, 0775, true);
 }

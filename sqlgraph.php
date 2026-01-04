@@ -1,13 +1,31 @@
 <?php
 include "local.php";
+
 $q = $_GET['q'] ?? null;
+
 $header = array_merge(["x"], $labels);
+
 ob_start();
 include __DIR__ . "/sqlproc.php";
 $dataRows = ob_get_clean();
+
 $dds = $dds ?? "";
 $dde = $dde ?? "";
 $title = trim("$mytitle $dds $dde");
+
+$vAxes = [
+  0 => ['title' => $axisTitleLeft],
+  1 => ['title' => $axisTitleRight],
+];
+
+if (!empty($yLeftMin0)) {
+  $vAxes[0]['viewWindowMode'] = 'explicit';
+  $vAxes[0]['viewWindow'] = ['min' => 0];
+}
+if (!empty($yRightMin0)) {
+  $vAxes[1]['viewWindowMode'] = 'explicit';
+  $vAxes[1]['viewWindow'] = ['min' => 0];
+}
 ?>
 
 <!doctype html>
@@ -37,14 +55,11 @@ $title = trim("$mytitle $dds $dde");
           slantedTextAngle: 90
         },
 
-        vAxes: {
-          0: { title: <?= json_encode($axisTitleLeft,  JSON_UNESCAPED_UNICODE) ?> },
-          1: { title: <?= json_encode($axisTitleRight, JSON_UNESCAPED_UNICODE) ?> }
-        },
+        vAxes: <?= json_encode($vAxes, JSON_UNESCAPED_UNICODE) ?>,
 
         series: <?= json_encode($seriesOpt, JSON_UNESCAPED_UNICODE) ?>,
       };
-		
+
       new google.visualization.LineChart(document.getElementById('curve_chart'))
         .draw(data, options);
     }

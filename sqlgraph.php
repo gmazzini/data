@@ -7,7 +7,7 @@ include __DIR__ . "/sqlproc.php";
 $dataRows = ob_get_clean();
 $dds = $dds ?? "";
 $dde = $dde ?? "";
-$title = trim("$dds $dde");
+$title = trim("$mytitle $dds $dde");
 ?>
 
 <!doctype html>

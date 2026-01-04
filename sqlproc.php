@@ -76,9 +76,14 @@ for ($i = 0; $i < count($tab); $i++) {
         static $skip = [
           'null','true','false',
           'abs','avg','count','sum','min','max',
-          'if','ifnull','coalesce',
+          'if','ifnull','coalesce','nullif',
           'round','floor','ceil',
-          'date','now','unix_timestamp'
+          'date','now','unix_timestamp',
+          'case','when','then','else','end',
+          'over','partition','by',
+          'rows','range','groups',
+          'current_row','unbounded',
+          'preceding','following'
         ];
         if (in_array($w, $skip, true)) return $m[1];
         return $als . ".`" . $m[1] . "`";

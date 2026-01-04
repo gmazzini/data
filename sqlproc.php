@@ -197,7 +197,7 @@ while ($row = mysqli_fetch_assoc($res)) {
     );
 
     foreach ($seriesKeys as $k) {
-      $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : ($seen[$k] ? null : 0.0);
+      $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
       $out[] = ($m === null) ? "null" : sprintf("%9.5f", $m);
       $acc[$k] = 0.0;
       $cnt[$k] = 0;

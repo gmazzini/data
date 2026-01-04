@@ -36,6 +36,8 @@ if (substr($q, 4, 1) == "d") {
 
 $sds = strtotime($ds);
 $sde = strtotime($de);
+$dds = "from day:".date("z",$sds).":".date("w",$sds)." week:".date("W",$sds)." month:".date("m",$sds);
+$dde = "to day:".date("z",$sde).":".date("w",$sde)." week:".date("W",$sde)." month:".date("m",$sde);
 
 $cache_path = "$cache_dir/$q";
 if (file_exists($cache_path)) {

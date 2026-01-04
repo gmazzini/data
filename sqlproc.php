@@ -61,10 +61,32 @@ for ($i = 0; $i < count($tab); $i++) {
   $als = "t$i";
   $joins[] = "LEFT JOIN $tbl $als ON $als.epoch = e.epoch";
 
-  foreach ($tab[$i]["cols"] as $col) {
-    $key = "{$als}__{$col}";
-    $selectCols[] = "$als.$col AS $key";
+  foreach ($tab[$i]["cols"] as $colIndex => $col) {
+    $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
+    $key = "{$als}__{$safeCol}_{$colIndex}";
     $seriesKeys[] = $key;
+    if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
+      $selectCols[] = "$als.`$col` AS `$key`";
+      continue;
+    }
+    $expr = preg_replace_callback(
+      '/\b([A-Za-z_][A-Za-z0-9_]*)\b/',
+      function($m) use ($als) {
+        $w = strtolower($m[1]);
+        static $skip = [
+          'null','true','false',
+          'abs','avg','count','sum','min','max',
+          'if','ifnull','coalesce',
+          'round','floor','ceil',
+          'date','now','unix_timestamp'
+        ];
+        if (in_array($w, $skip, true)) return $m[1];
+        return $als . ".`" . $m[1] . "`";
+      },
+      $col
+    );
+
+    $selectCols[] = "($expr) AS `$key`";
   }
 }
 

@@ -13,21 +13,78 @@ $dds = $dds ?? "";
 $dde = $dde ?? "";
 $title = trim("$mytitle $dds $dde");
 
+$yLeftMin0  = !empty($yLeftMin0);
+$yRightMin0 = !empty($yRightMin0);
+
+$rowsText = trim($dataRows);
+$rowsText = rtrim($rowsText, ", \r\n\t");
+
+$rows = [];
+if ($rowsText !== "") {
+  $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
+  $rows = json_decode($jsonish, true);
+  if (!is_array($rows)) $rows = [];
+}
+
+$minAxis = [0 => null, 1 => null];
+
+foreach ($rows as $r) {
+  for ($j = 1; $j < count($r); $j++) {
+    $v = $r[$j];
+    if ($v === null) continue;
+
+    $axis = 0;
+    if (isset($seriesOpt[$j-1]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$j-1]['targetAxisIndex'];
+    }
+
+    if ($minAxis[$axis] === null || $v < $minAxis[$axis]) {
+      $minAxis[$axis] = $v;
+    }
+  }
+}
+
+foreach ($rows as &$r) {
+  for ($j = 1; $j < count($r); $j++) {
+    if ($r[$j] === null) continue;
+
+    $axis = 0;
+    if (isset($seriesOpt[$j-1]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$j-1]['targetAxisIndex'];
+    }
+
+    if ($axis === 0 && $yLeftMin0 && $minAxis[0] !== null) {
+      $r[$j] = $r[$j] - $minAxis[0];
+    } elseif ($axis === 1 && $yRightMin0 && $minAxis[1] !== null) {
+      $r[$j] = $r[$j] - $minAxis[1];
+    }
+  }
+}
+unset($r);
+
+$dataRowsJs = [];
+foreach ($rows as $r) {
+  $out = [];
+  $out[] = json_encode($r[0], JSON_UNESCAPED_UNICODE);
+  for ($j = 1; $j < count($r); $j++) {
+    $out[] = ($r[$j] === null) ? "null" : sprintf("%.5f", (float)$r[$j]);
+  }
+  $dataRowsJs[] = "[" . implode(", ", $out) . "]";
+}
+$dataRowsFinal = implode(",\n        ", $dataRowsJs);
+
 $vAxes = [
   0 => ['title' => $axisTitleLeft],
   1 => ['title' => $axisTitleRight],
 ];
 
-if (!empty($yLeftMin0)) {
-  $vAxes[0]['viewWindowMode'] = 'explicit';
-  $vAxes[0]['viewWindow'] = ['min' => 0];
+if ($yLeftMin0 && $minAxis[0] !== null) {
+  $vAxes[0]['title'] = $axisTitleLeft . " (offset: -" . $minAxis[0] . ")";
 }
-if (!empty($yRightMin0)) {
-  $vAxes[1]['viewWindowMode'] = 'explicit';
-  $vAxes[1]['viewWindow'] = ['min' => 0];
+if ($yRightMin0 && $minAxis[1] !== null) {
+  $vAxes[1]['title'] = $axisTitleRight . " (offset: -" . $minAxis[1] . ")";
 }
 ?>
-
 <!doctype html>
 <html lang="it">
 <head>
@@ -41,7 +98,7 @@ if (!empty($yRightMin0)) {
     function drawChart() {
       const data = google.visualization.arrayToDataTable([
         <?= json_encode($header, JSON_UNESCAPED_UNICODE) ?>,
-        <?= $dataRows ?>
+        <?= $dataRowsFinal !== "" ? "\n        " . $dataRowsFinal . "\n      " : "" ?>
       ]);
 
       const options = {

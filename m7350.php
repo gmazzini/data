@@ -1,7 +1,7 @@
 #!/usr/bin/env php
 <?php
 declare(strict_types=1);
-include m7350.php;
+include "m7350_local.php";
 
 function send_post(string $keyp,string $from, string $content, int $ts): void {
   $url = 'https://data.mazzini.org/mysms.php';

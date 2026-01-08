@@ -1,11 +1,7 @@
 #!/usr/bin/env php
 <?php
+include m7350.php;
 declare(strict_types=1);
-
-$HOST = '10.10.10.1';
-$USER = 'admin';
-$PASS = 'admin';
-$KEYP = 'XOJ5zJVnIpDj010Vpp1wUkiR';
 
 function send_post(string $keyp,string $from, string $content, int $ts): void {
   $url = 'https://data.mazzini.org/mysms.php';

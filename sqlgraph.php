@@ -3,6 +3,12 @@ include "local.php";
 
 $q = $_GET['q'] ?? null;
 
+$labels = $labels ?? [];
+$seriesOpt = $seriesOpt ?? [];
+$axisTitleLeft = $axisTitleLeft ?? "";
+$axisTitleRight = $axisTitleRight ?? "";
+$mytitle = $mytitle ?? "";
+
 $header = array_merge(["x"], $labels);
 
 ob_start();
@@ -20,22 +26,37 @@ $rowsText = trim($dataRows);
 $rowsText = rtrim($rowsText, ", \r\n\t");
 
 $rows = [];
+
 if ($rowsText !== "") {
   $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
   $rows = json_decode($jsonish, true);
-  if (!is_array($rows)) $rows = [];
+
+  if (!is_array($rows)) {
+    $rows = [];
+  }
 }
 
-$minAxis = [0 => null, 1 => null];
+$minAxis = [
+  0 => null,
+  1 => null
+];
 
 foreach ($rows as $r) {
   for ($j = 1; $j < count($r); $j++) {
     $v = $r[$j];
-    if ($v === null) continue;
+
+    if ($v === null) {
+      continue;
+    }
 
     $axis = 0;
-    if (isset($seriesOpt[$j-1]['targetAxisIndex'])) {
-      $axis = (int)$seriesOpt[$j-1]['targetAxisIndex'];
+
+    if (isset($seriesOpt[$j - 1]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$j - 1]['targetAxisIndex'];
+    }
+
+    if (!isset($minAxis[$axis])) {
+      $minAxis[$axis] = null;
     }
 
     if ($minAxis[$axis] === null || $v < $minAxis[$axis]) {
@@ -46,11 +67,14 @@ foreach ($rows as $r) {
 
 foreach ($rows as &$r) {
   for ($j = 1; $j < count($r); $j++) {
-    if ($r[$j] === null) continue;
+    if ($r[$j] === null) {
+      continue;
+    }
 
     $axis = 0;
-    if (isset($seriesOpt[$j-1]['targetAxisIndex'])) {
-      $axis = (int)$seriesOpt[$j-1]['targetAxisIndex'];
+
+    if (isset($seriesOpt[$j - 1]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$j - 1]['targetAxisIndex'];
     }
 
     if ($axis === 0 && $yLeftMin0 && $minAxis[0] !== null) {
@@ -63,14 +87,23 @@ foreach ($rows as &$r) {
 unset($r);
 
 $dataRowsJs = [];
+
 foreach ($rows as $r) {
   $out = [];
-  $out[] = json_encode($r[0], JSON_UNESCAPED_UNICODE);
-  for ($j = 1; $j < count($r); $j++) {
-    $out[] = ($r[$j] === null) ? "null" : sprintf("%.5f", (float)$r[$j]);
+
+  $out[] = json_encode($r[0] ?? "", JSON_UNESCAPED_UNICODE);
+
+  for ($j = 1; $j < count($header); $j++) {
+    if (!array_key_exists($j, $r) || $r[$j] === null) {
+      $out[] = "null";
+    } else {
+      $out[] = sprintf("%.5f", (float)$r[$j]);
+    }
   }
+
   $dataRowsJs[] = "[" . implode(", ", $out) . "]";
 }
+
 $dataRowsFinal = implode(",\n        ", $dataRowsJs);
 
 $vAxes = [
@@ -81,9 +114,13 @@ $vAxes = [
 if ($yLeftMin0 && $minAxis[0] !== null) {
   $vAxes[0]['title'] = $axisTitleLeft . " (offset: -" . $minAxis[0] . ")";
 }
+
 if ($yRightMin0 && $minAxis[1] !== null) {
   $vAxes[1]['title'] = $axisTitleRight . " (offset: -" . $minAxis[1] . ")";
 }
+
+$vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);
+$seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 ?>
 <!doctype html>
 <html lang="it">
@@ -96,8 +133,15 @@ if ($yRightMin0 && $minAxis[1] !== null) {
     google.charts.setOnLoadCallback(drawChart);
 
     function drawChart() {
-      const data = google.visualization.arrayToDataTable([
-        <?= json_encode($header, JSON_UNESCAPED_UNICODE) ?>,
+      const data = new google.visualization.DataTable();
+
+      data.addColumn('string', <?= json_encode($header[0] ?? "x", JSON_UNESCAPED_UNICODE) ?>);
+
+<?php for ($i = 1; $i < count($header); $i++): ?>
+      data.addColumn('number', <?= json_encode($header[$i], JSON_UNESCAPED_UNICODE) ?>);
+<?php endfor; ?>
+
+      data.addRows([
         <?= $dataRowsFinal !== "" ? "\n        " . $dataRowsFinal . "\n      " : "" ?>
       ]);
 
@@ -112,9 +156,10 @@ if ($yRightMin0 && $minAxis[1] !== null) {
           slantedTextAngle: 90
         },
 
-        vAxes: <?= json_encode($vAxes, JSON_UNESCAPED_UNICODE) ?>,
+        vAxes: <?= $vAxesJs ?>,
 
-        series: <?= json_encode($seriesOpt, JSON_UNESCAPED_UNICODE) ?>,
+        series: <?= $seriesOptJs ?>
+
       };
 
       new google.visualization.LineChart(document.getElementById('curve_chart'))

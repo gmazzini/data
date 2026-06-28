@@ -39,13 +39,31 @@ $sde = strtotime($de);
 $dds = "from day:".date("z",$sds).":".date("w",$sds)." week:".date("W",$sds)." month:".date("m",$sds);
 $dde = "to day:".date("z",$sde).":".date("w",$sde)." week:".date("W",$sde)." month:".date("m",$sde);
 
+$axisRange = [
+  0 => ['min' => 0, 'max' => 1],
+  1 => ['min' => 0, 'max' => 1],
+];
+
+$axisStats = [
+  0 => ['min' => null, 'max' => null],
+  1 => ['min' => null, 'max' => null],
+];
+
 // Cache retrocompatibile ma distinta per configurazione.
 // Serve perché lo stesso q può rappresentare grafici diversi:
 // tabelle diverse, device diversi, colonne diverse, points diverso.
 $cache_key = md5(json_encode($tab) . "|" . $points . "|" . $q);
 $cache_path = "$cache_dir/$q-$cache_key";
+$cache_axis_path = "$cache_path.axis.json";
 
-if (file_exists($cache_path)) {
+if (file_exists($cache_path) && file_exists($cache_axis_path)) {
+  $axisJson = file_get_contents($cache_axis_path);
+  $axisTmp = json_decode($axisJson, true);
+
+  if (is_array($axisTmp)) {
+    $axisRange = $axisTmp;
+  }
+
   echo file_get_contents($cache_path);
   return;
 }
@@ -64,9 +82,6 @@ for ($i = 0; $i < count($tab); $i++) {
 
   $where = "epoch BETWEEN $sds AND $sde";
 
-  // Nuovo comportamento opzionale:
-  // se "device" esiste nella configurazione, filtro la tabella su quel device.
-  // Se non esiste, il comportamento resta quello vecchio.
   if (isset($tab[$i]["device"])) {
     $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
     $where .= " AND device = '$dev'";
@@ -79,6 +94,7 @@ $unionSql = implode("\n  UNION\n  ", $unionParts);
 $selectCols = ["e.epoch"];
 $joins      = [];
 $seriesKeys = [];
+$seriesAxes = [];
 
 for ($i = 0; $i < count($tab); $i++) {
   $tbl = $tab[$i]["table"];
@@ -86,8 +102,6 @@ for ($i = 0; $i < count($tab); $i++) {
 
   $joinCond = "$als.epoch = e.epoch";
 
-  // Stesso filtro anche nella LEFT JOIN, così ogni serie prende solo
-  // i valori del suo device.
   if (isset($tab[$i]["device"])) {
     $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
     $joinCond .= " AND $als.device = '$dev'";
@@ -98,7 +112,15 @@ for ($i = 0; $i < count($tab); $i++) {
   foreach ($tab[$i]["cols"] as $colIndex => $col) {
     $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
     $key = "{$als}__{$safeCol}_{$colIndex}";
+    $seriesIndex = count($seriesKeys);
+
     $seriesKeys[] = $key;
+
+    $axis = 0;
+    if (isset($seriesOpt[$seriesIndex]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$seriesIndex]['targetAxisIndex'];
+    }
+    $seriesAxes[$key] = $axis;
 
     if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
       $selectCols[] = "$als.`$col` AS `$key`";
@@ -150,6 +172,8 @@ ORDER BY e.epoch
 $resN = mysqli_query($conn, $sqlCount);
 if (!$resN) {
   mysqli_close($conn);
+
+  file_put_contents($cache_axis_path, json_encode($axisRange));
   echo "[]";
   return;
 }
@@ -160,7 +184,10 @@ mysqli_free_result($resN);
 $N = (int)$rowN["N"];
 if ($N <= 0) {
   mysqli_close($conn);
+
   file_put_contents($cache_path, "[]");
+  file_put_contents($cache_axis_path, json_encode($axisRange));
+
   echo "[]";
   return;
 }
@@ -170,6 +197,8 @@ $agg = max(1, (int)ceil($N / $points));
 $fp = fopen($cache_path, "w");
 if (!$fp) {
   mysqli_close($conn);
+
+  file_put_contents($cache_axis_path, json_encode($axisRange));
   echo "[]";
   return;
 }
@@ -193,7 +222,10 @@ $res = mysqli_query($conn, $sqlData);
 if (!$res) {
   fclose($fp);
   @unlink($cache_path);
+  @unlink($cache_axis_path);
   mysqli_close($conn);
+
+  file_put_contents($cache_axis_path, json_encode($axisRange));
   echo "[]";
   return;
 }
@@ -228,7 +260,27 @@ while ($row = mysqli_fetch_assoc($res)) {
 
     foreach ($seriesKeys as $k) {
       $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
-      $out[] = ($m === null) ? "null" : sprintf("%9.5f", $m);
+
+      if ($m === null) {
+        $out[] = "null";
+      } else {
+        $axis = $seriesAxes[$k] ?? 0;
+
+        if (!isset($axisStats[$axis])) {
+          $axisStats[$axis] = ['min' => null, 'max' => null];
+        }
+
+        if ($axisStats[$axis]['min'] === null || $m < $axisStats[$axis]['min']) {
+          $axisStats[$axis]['min'] = $m;
+        }
+
+        if ($axisStats[$axis]['max'] === null || $m > $axisStats[$axis]['max']) {
+          $axisStats[$axis]['max'] = $m;
+        }
+
+        $out[] = sprintf("%9.5f", $m);
+      }
+
       $acc[$k] = 0.0;
       $cnt[$k] = 0;
     }
@@ -248,7 +300,26 @@ if ($nagg > 0 && $lastEpochInBucket !== null) {
 
   foreach ($seriesKeys as $k) {
     $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
-    $out[] = ($m === null) ? "null" : sprintf("%9.5f", $m);
+
+    if ($m === null) {
+      $out[] = "null";
+    } else {
+      $axis = $seriesAxes[$k] ?? 0;
+
+      if (!isset($axisStats[$axis])) {
+        $axisStats[$axis] = ['min' => null, 'max' => null];
+      }
+
+      if ($axisStats[$axis]['min'] === null || $m < $axisStats[$axis]['min']) {
+        $axisStats[$axis]['min'] = $m;
+      }
+
+      if ($axisStats[$axis]['max'] === null || $m > $axisStats[$axis]['max']) {
+        $axisStats[$axis]['max'] = $m;
+      }
+
+      $out[] = sprintf("%9.5f", $m);
+    }
   }
 
   fprintf($fp, "[%s],\n", implode(", ", $out));
@@ -257,6 +328,34 @@ if ($nagg > 0 && $lastEpochInBucket !== null) {
 mysqli_free_result($res);
 mysqli_close($conn);
 fclose($fp);
+
+for ($axis = 0; $axis <= 1; $axis++) {
+  if (
+    isset($axisStats[$axis]) &&
+    $axisStats[$axis]['min'] !== null &&
+    $axisStats[$axis]['max'] !== null
+  ) {
+    $min = (float)$axisStats[$axis]['min'];
+    $max = (float)$axisStats[$axis]['max'];
+
+    if ($min == $max) {
+      $min = $min - 1;
+      $max = $max + 1;
+    }
+
+    $axisRange[$axis] = [
+      'min' => $min,
+      'max' => $max
+    ];
+  } else {
+    $axisRange[$axis] = [
+      'min' => 0,
+      'max' => 1
+    ];
+  }
+}
+
+file_put_contents($cache_axis_path, json_encode($axisRange));
 
 echo file_get_contents($cache_path);
 
@@ -275,6 +374,7 @@ if (substr($q, 4, 1) == "d") {
 
 if ($q == $vq) {
   @unlink($cache_path);
+  @unlink($cache_axis_path);
 }
 
 ?>

@@ -42,7 +42,11 @@ $minAxis = [
 ];
 
 foreach ($rows as $r) {
-  for ($j = 1; $j < count($r); $j++) {
+  for ($j = 1; $j < count($header); $j++) {
+    if (!array_key_exists($j, $r)) {
+      continue;
+    }
+
     $v = $r[$j];
 
     if ($v === null) {
@@ -64,27 +68,6 @@ foreach ($rows as $r) {
     }
   }
 }
-
-foreach ($rows as &$r) {
-  for ($j = 1; $j < count($r); $j++) {
-    if ($r[$j] === null) {
-      continue;
-    }
-
-    $axis = 0;
-
-    if (isset($seriesOpt[$j - 1]['targetAxisIndex'])) {
-      $axis = (int)$seriesOpt[$j - 1]['targetAxisIndex'];
-    }
-
-    if ($axis === 0 && $yLeftMin0 && $minAxis[0] !== null) {
-      $r[$j] = $r[$j] - $minAxis[0];
-    } elseif ($axis === 1 && $yRightMin0 && $minAxis[1] !== null) {
-      $r[$j] = $r[$j] - $minAxis[1];
-    }
-  }
-}
-unset($r);
 
 $dataRowsJs = [];
 
@@ -111,12 +94,18 @@ $vAxes = [
   1 => ['title' => $axisTitleRight],
 ];
 
-if ($yLeftMin0 && $minAxis[0] !== null) {
-  $vAxes[0]['title'] = $axisTitleLeft . " (offset: -" . $minAxis[0] . ")";
+if ($yLeftMin0 && isset($minAxis[0]) && $minAxis[0] !== null) {
+  $vAxes[0]['viewWindow'] = [
+    'min' => (float)$minAxis[0]
+  ];
+  $vAxes[0]['title'] = $axisTitleLeft . " (min: " . $minAxis[0] . ")";
 }
 
-if ($yRightMin0 && $minAxis[1] !== null) {
-  $vAxes[1]['title'] = $axisTitleRight . " (offset: -" . $minAxis[1] . ")";
+if ($yRightMin0 && isset($minAxis[1]) && $minAxis[1] !== null) {
+  $vAxes[1]['viewWindow'] = [
+    'min' => (float)$minAxis[1]
+  ];
+  $vAxes[1]['title'] = $axisTitleRight . " (min: " . $minAxis[1] . ")";
 }
 
 $vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);

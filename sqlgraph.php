@@ -19,9 +19,6 @@ $dds = $dds ?? "";
 $dde = $dde ?? "";
 $title = trim("$mytitle $dds $dde");
 
-$yLeftMin0  = !empty($yLeftMin0);
-$yRightMin0 = !empty($yRightMin0);
-
 $rowsText = trim($dataRows);
 $rowsText = rtrim($rowsText, ", \r\n\t");
 
@@ -33,39 +30,6 @@ if ($rowsText !== "") {
 
   if (!is_array($rows)) {
     $rows = [];
-  }
-}
-
-$minAxis = [
-  0 => null,
-  1 => null
-];
-
-foreach ($rows as $r) {
-  for ($j = 1; $j < count($header); $j++) {
-    if (!array_key_exists($j, $r)) {
-      continue;
-    }
-
-    $v = $r[$j];
-
-    if ($v === null) {
-      continue;
-    }
-
-    $axis = 0;
-
-    if (isset($seriesOpt[$j - 1]['targetAxisIndex'])) {
-      $axis = (int)$seriesOpt[$j - 1]['targetAxisIndex'];
-    }
-
-    if (!isset($minAxis[$axis])) {
-      $minAxis[$axis] = null;
-    }
-
-    if ($minAxis[$axis] === null || $v < $minAxis[$axis]) {
-      $minAxis[$axis] = $v;
-    }
   }
 }
 
@@ -89,23 +53,41 @@ foreach ($rows as $r) {
 
 $dataRowsFinal = implode(",\n        ", $dataRowsJs);
 
+$axisRange = $axisRange ?? [
+  0 => ['min' => 0, 'max' => 1],
+  1 => ['min' => 0, 'max' => 1],
+];
+
 $vAxes = [
   0 => ['title' => $axisTitleLeft],
   1 => ['title' => $axisTitleRight],
 ];
 
-if ($yLeftMin0 && isset($minAxis[0]) && $minAxis[0] !== null) {
-  $vAxes[0]['viewWindow'] = [
-    'min' => (float)$minAxis[0]
-  ];
-  $vAxes[0]['title'] = $axisTitleLeft . " (min: " . $minAxis[0] . ")";
-}
+for ($axis = 0; $axis <= 1; $axis++) {
+  if (
+    isset($axisRange[$axis]) &&
+    isset($axisRange[$axis]['min']) &&
+    isset($axisRange[$axis]['max'])
+  ) {
+    $min = (float)$axisRange[$axis]['min'];
+    $max = (float)$axisRange[$axis]['max'];
 
-if ($yRightMin0 && isset($minAxis[1]) && $minAxis[1] !== null) {
-  $vAxes[1]['viewWindow'] = [
-    'min' => (float)$minAxis[1]
-  ];
-  $vAxes[1]['title'] = $axisTitleRight . " (min: " . $minAxis[1] . ")";
+    if ($min == $max) {
+      $min = $min - 1;
+      $max = $max + 1;
+    }
+
+    $vAxes[$axis]['viewWindow'] = [
+      'min' => $min,
+      'max' => $max
+    ];
+
+    if ($axis === 0) {
+      $vAxes[$axis]['title'] = $axisTitleLeft . " (" . $min . " - " . $max . ")";
+    } else {
+      $vAxes[$axis]['title'] = $axisTitleRight . " (" . $min . " - " . $max . ")";
+    }
+  }
 }
 
 $vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);

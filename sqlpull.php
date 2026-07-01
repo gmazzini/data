@@ -1,5 +1,5 @@
 <?php
-include "local.php";
+include "/home/www/sensori/local.php";
 
 if($argc<3)exit(0);
 

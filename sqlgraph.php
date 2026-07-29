@@ -45,6 +45,25 @@ if (preg_match('/^(\d{4})([dwm])(\d+)$/', $q_raw, $m)) {
     }
 }
 
+// Determine maximum allowed limit (today/current period)
+$dt_now = new DateTime();
+$dt_now->setTime(0, 0, 0);
+
+if ($current_mode === 'w') {
+    $dt_max = clone $dt_now;
+    $dt_max->setISODate((int)$dt_now->format('Y'), (int)$dt_now->format('W'), 1);
+} else if ($current_mode === 'm') {
+    $dt_max = clone $dt_now;
+    $dt_max->setDate((int)$dt_now->format('Y'), (int)$dt_now->format('n'), 1);
+} else {
+    $dt_max = clone $dt_now;
+}
+
+// Cap navigation so user cannot request future dates
+if ($dt > $dt_max) {
+    $dt = clone $dt_max;
+}
+
 // Calculate Previous and Next periods
 $dt_prev = clone $dt;
 $dt_next = clone $dt;
@@ -60,11 +79,17 @@ if ($current_mode === 'w') {
     $dt_next->modify('+1 day');
 }
 
+// Check if next period exceeds current date limit
+$is_future = ($dt_next > $dt_max);
+
 $q_prev = build_q_param($dt_prev, $current_mode);
 $q_next = build_q_param($dt_next, $current_mode);
 
+// Set $q variable required by sqlproc.php
+$q = build_q_param($dt, $current_mode);
+
 // Calculate ACT (Current time)
-$q_act = build_q_param(new DateTime(), $current_mode);
+$q_act = build_q_param($dt_max, $current_mode);
 
 // Calculate mode switch buttons
 $q_mode_d = build_q_param($dt, 'd');
@@ -179,21 +204,21 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
   <meta charset="utf-8" />
   <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
   <style>
-    body { margin: 8px; font-family: Arial, sans-serif; }
+    body { margin: 4px; font-family: Arial, sans-serif; }
     .nav-toolbar {
       display: flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
       background: #f1f3f5;
-      padding: 5px 10px;
-      border-radius: 5px;
+      padding: 3px 8px;
+      border-radius: 4px;
       border: 1px solid #ced4da;
-      margin-bottom: 8px;
+      margin-bottom: 0px;
       font-size: 13px;
     }
     .nav-btn {
       display: inline-block;
-      padding: 3px 10px;
+      padding: 2px 8px;
       background: #ffffff;
       color: #333333;
       text-decoration: none;
@@ -208,6 +233,12 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
       color: #ffffff;
       border-color: #0d6efd;
     }
+    .nav-btn.disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      pointer-events: none;
+      background: #e9ecef;
+    }
     .nav-btn-act {
       background: #198754;
       color: #ffffff;
@@ -215,7 +246,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-btn-act:hover { background: #157347; }
     .nav-date-label {
-      margin-left: 12px;
+      margin-left: 8px;
       font-weight: bold;
       color: #212529;
     }
@@ -265,7 +296,11 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
   <!-- Navigation Toolbar -->
   <div class="nav-toolbar">
     <a href="?q=<?= $q_prev ?>" class="nav-btn" title="Precedente">&laquo;</a>
-    <a href="?q=<?= $q_next ?>" class="nav-btn" title="Successivo">&raquo;</a>
+    <?php if ($is_future): ?>
+      <span class="nav-btn disabled" title="Periodo futuro non disponibile">&raquo;</span>
+    <?php else: ?>
+      <a href="?q=<?= $q_next ?>" class="nav-btn" title="Successivo">&raquo;</a>
+    <?php endif; ?>
     <a href="?q=<?= $q_act ?>" class="nav-btn nav-btn-act" title="Data Attuale">ACT</a>
     &nbsp;|
     <a href="?q=<?= $q_mode_d ?>" class="nav-btn <?= $current_mode === 'd' ? 'active' : '' ?>">DAY</a>

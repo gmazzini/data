@@ -1,7 +1,7 @@
 <?php
-// sqlproc.php - Data processing and caching engine
+// sqlproc.php - Data processing and caching engine with differential mode support
 
-// Load local.php dynamically from the current working directory
+// Load local.php dynamically from current working directory
 $local_config = getcwd() . '/local.php';
 if (file_exists($local_config)) {
     require_once $local_config;
@@ -119,10 +119,11 @@ for ($i = 0; $i < count($tab); $i++) {
 }
 $unionSql = implode("\n  UNION\n  ", $unionParts);
 
-$selectCols = ["e.epoch"];
-$joins      = [];
-$seriesKeys = [];
-$seriesAxes = [];
+$selectCols   = ["e.epoch"];
+$joins        = [];
+$seriesKeys   = [];
+$seriesAxes   = [];
+$seriesDeltas = [];
 
 for ($i = 0; $i < count($tab); $i++) {
   $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
@@ -137,12 +138,15 @@ for ($i = 0; $i < count($tab); $i++) {
 
   $joins[] = "LEFT JOIN $tbl $als ON $joinCond";
 
+  $is_delta = !empty($tab[$i]["delta"]);
+
   foreach ($tab[$i]["cols"] as $colIndex => $col) {
     $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
     $key = "{$als}__{$safeCol}_{$colIndex}";
     $seriesIndex = count($seriesKeys);
 
     $seriesKeys[] = $key;
+    $seriesDeltas[$key] = $is_delta;
 
     $axis = 0;
     if (isset($seriesOpt[$seriesIndex]['targetAxisIndex'])) {
@@ -237,16 +241,18 @@ if (!$fp) {
   return;
 }
 
-$last = [];
-$seen = [];
-$acc  = [];
-$cnt  = [];
+$last    = [];
+$seen    = [];
+$acc     = [];
+$cnt     = [];
+$prevRaw = [];
 
 foreach ($seriesKeys as $k) {
-  $last[$k] = null;
-  $seen[$k] = false;
-  $acc[$k]  = 0.0;
-  $cnt[$k]  = 0;
+  $last[$k]    = null;
+  $seen[$k]    = false;
+  $acc[$k]     = 0.0;
+  $cnt[$k]     = 0;
+  $prevRaw[$k] = null;
 }
 
 $nagg = 0;
@@ -271,15 +277,27 @@ while ($row = mysqli_fetch_assoc($res)) {
 
   foreach ($seriesKeys as $k) {
     if ($row[$k] !== null) {
-      $last[$k] = (float)$row[$k];
-      $seen[$k] = true;
-    }
+      $currVal = (float)$row[$k];
 
-    $v = ($last[$k] !== null) ? $last[$k] : null;
-
-    if ($v !== null) {
-      $acc[$k] += $v;
-      $cnt[$k] += 1;
+      if ($seriesDeltas[$k]) {
+        // Calculate differential value (delta from previous measurement)
+        if ($prevRaw[$k] !== null) {
+          $delta = $currVal - $prevRaw[$k];
+          if ($delta >= 0) {
+            $last[$k] = $delta;
+            $seen[$k] = true;
+            $acc[$k] += $delta;
+            $cnt[$k] += 1;
+          }
+        }
+        $prevRaw[$k] = $currVal;
+      } else {
+        // Standard absolute value processing
+        $last[$k] = $currVal;
+        $seen[$k] = true;
+        $acc[$k] += $currVal;
+        $cnt[$k] += 1;
+      }
     }
   }
 

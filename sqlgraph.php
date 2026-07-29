@@ -1,144 +1,130 @@
 <?php
-include "local.php";
+/**
+ * sqlgraph.php - Rendering del grafico con cache flat in tmp/
+ * Sfrutta tutte le variabili di configurazione grafiche e di autenticazione di local.php
+ */
 
-$q = $_GET['q'] ?? null;
+require_once __DIR__ . '/local.php';
+require_once __DIR__ . '/sqlproc.php';
 
-$labels = $labels ?? [];
-$seriesOpt = $seriesOpt ?? [];
-$axisTitleLeft = $axisTitleLeft ?? "";
-$axisTitleRight = $axisTitleRight ?? "";
-$mytitle = $mytitle ?? "";
+// ---------------------------------------------------------
+// 1. AUTENTICAZIONE E SICUREZZA
+// ---------------------------------------------------------
+$req_auth = $_GET['auth'] ?? $_GET['key'] ?? '';
+if (!empty($auth_key) && !empty($myauth)) {
+    if ($req_auth !== $auth_key && $req_auth !== $myauth) {
+        http_response_code(403);
+        die("Accesso negato: chiave di autenticazione non valida.");
+    }
+}
 
-$header = array_merge(["x"], $labels);
+// ---------------------------------------------------------
+// 2. SANIFICAZIONE PARAMETRI TEMPORALI
+// ---------------------------------------------------------
+$hours = filter_input(INPUT_GET, 'hours', FILTER_VALIDATE_INT) ?: 24;
+$raw_from = $_GET['from'] ?? "-{$hours} hours";
+$raw_to   = $_GET['to']   ?? 'now';
 
+$time_from = strtotime($raw_from);
+$time_to   = strtotime($raw_to);
+
+if ($time_from === false || $time_to === false) {
+    http_response_code(400);
+    die("Formato data/ora non valido.");
+}
+
+$from_str = date('Y-m-d H:i:s', $time_from);
+$to_str   = date('Y-m-d H:i:s', $time_to);
+
+// ---------------------------------------------------------
+// 3. CACHE DETERMINISTICA IN tmp/ (Zero proliferazione file)
+// ---------------------------------------------------------
+$cache_dir_path = __DIR__ . '/' . trim($cache_dir, '/');
+if (!is_dir($cache_dir_path)) {
+    @mkdir($cache_dir_path, 0755, true);
+}
+
+// Hash univoco basato sull'intervallo richiesto e sui parametri grafici
+$cache_hash = md5("{$from_str}_{$to_str}_" . serialize($labels));
+$cache_file = "{$cache_dir_path}/g_{$cache_hash}.html";
+$cache_ttl  = 300; // La cache dura 5 minuti (300 secondi)
+
+// Se la cache esiste ed è ancora valida, la eroga subito
+if (file_exists($cache_file) && (time() - filemtime($cache_file) < $cache_ttl)) {
+    header('Content-Type: text/html; charset=utf-8');
+    readfile($cache_file);
+    exit;
+}
+
+// ---------------------------------------------------------
+// 4. ESTRAZIONE DATI IN RAM
+// ---------------------------------------------------------
+$dataset = get_sensors_data($from_str, $to_str);
+
+// ---------------------------------------------------------
+// 5. RENDERING GRAFICO (Google Charts HTML)
+// ---------------------------------------------------------
 ob_start();
-include __DIR__ . "/sqlproc.php";
-$dataRows = ob_get_clean();
-
-$dds = $dds ?? "";
-$dde = $dde ?? "";
-$title = trim("$mytitle $dds $dde");
-
-$rowsText = trim($dataRows);
-$rowsText = rtrim($rowsText, ", \r\n\t");
-
-$rows = [];
-
-if ($rowsText !== "") {
-  $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
-  $rows = json_decode($jsonish, true);
-
-  if (!is_array($rows)) {
-    $rows = [];
-  }
-}
-
-$dataRowsJs = [];
-
-foreach ($rows as $r) {
-  $out = [];
-
-  $out[] = json_encode($r[0] ?? "", JSON_UNESCAPED_UNICODE);
-
-  for ($j = 1; $j < count($header); $j++) {
-    if (!array_key_exists($j, $r) || $r[$j] === null) {
-      $out[] = "null";
-    } else {
-      $out[] = sprintf("%.5f", (float)$r[$j]);
-    }
-  }
-
-  $dataRowsJs[] = "[" . implode(", ", $out) . "]";
-}
-
-$dataRowsFinal = implode(",\n        ", $dataRowsJs);
-
-$axisRange = $axisRange ?? [
-  0 => ['min' => 0, 'max' => 1],
-  1 => ['min' => 0, 'max' => 1],
-];
-
-$vAxes = [
-  0 => ['title' => $axisTitleLeft],
-  1 => ['title' => $axisTitleRight],
-];
-
-for ($axis = 0; $axis <= 1; $axis++) {
-  if (
-    isset($axisRange[$axis]) &&
-    isset($axisRange[$axis]['min']) &&
-    isset($axisRange[$axis]['max'])
-  ) {
-    $min = (float)$axisRange[$axis]['min'];
-    $max = (float)$axisRange[$axis]['max'];
-
-    if ($min == $max) {
-      $min = $min - 1;
-      $max = $max + 1;
-    }
-
-    $vAxes[$axis]['viewWindow'] = [
-      'min' => $min,
-      'max' => $max
-    ];
-
-    if ($axis === 0) {
-      $vAxes[$axis]['title'] = $axisTitleLeft . " (" . $min . " - " . $max . ")";
-    } else {
-      $vAxes[$axis]['title'] = $axisTitleRight . " (" . $min . " - " . $max . ")";
-    }
-  }
-}
-
-$vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);
-$seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 ?>
-<!doctype html>
+<!DOCTYPE html>
 <html lang="it">
 <head>
-  <meta charset="utf-8" />
-  <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
-  <script src="https://www.gstatic.com/charts/loader.js"></script>
-  <script>
-    google.charts.load('current', {packages:['corechart']});
-    google.charts.setOnLoadCallback(drawChart);
+    <meta charset="UTF-8">
+    <title><?= htmlspecialchars($mytitle) ?></title>
+    <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
+    <script type="text/javascript">
+      google.charts.load('current', {'packages':['corechart']});
+      google.charts.setOnLoadCallback(drawChart);
 
-    function drawChart() {
-      const data = new google.visualization.DataTable();
+      function drawChart() {
+        var data = new google.visualization.DataTable();
+        data.addColumn('datetime', 'Tempo');
+        
+        <?php foreach ($labels as $label): ?>
+        data.addColumn('number', <?= json_encode($label) ?>);
+        <?php endforeach; ?>
 
-      data.addColumn('string', <?= json_encode($header[0] ?? "x", JSON_UNESCAPED_UNICODE) ?>);
+        data.addRows([
+          <?php foreach ($dataset as $timestamp => $values): ?>
+          [new Date("<?= date('c', strtotime($timestamp)) ?>"), <?= implode(',', array_map(fn($v) => $v === null ? 'null' : $v, $values)) ?>],
+          <?php endforeach; ?>
+        ]);
 
-<?php for ($i = 1; $i < count($header); $i++): ?>
-      data.addColumn('number', <?= json_encode($header[$i], JSON_UNESCAPED_UNICODE) ?>);
-<?php endfor; ?>
+        var options = {
+          title: <?= json_encode($mytitle) ?>,
+          hAxis: { title: 'Data / Ora', format: 'dd/MM HH:mm' },
+          vAxis: { 
+            title: <?= json_encode($axisTitleLeft) ?>,
+            minValue: <?= $yLeftMin0 ? '0' : 'null' ?>
+          },
+          series: <?= json_encode($seriesOpt) ?>,
+          legend: { position: 'bottom' },
+          chartArea: { width: '85%', height: '70%' },
+          explorer: { actions: ['dragToPan', 'rightClickToReset'], keepInBounds: true }
+        };
 
-      data.addRows([
-        <?= $dataRowsFinal !== "" ? "\n        " . $dataRowsFinal . "\n      " : "" ?>
-      ]);
-
-      const options = {
-        title: <?= json_encode($title, JSON_UNESCAPED_UNICODE) ?>,
-        curveType: 'none',
-        legend: { position: 'top' },
-
-        hAxis: {
-          title: "Data/Ora",
-          slantedText: true,
-          slantedTextAngle: 90
-        },
-
-        vAxes: <?= $vAxesJs ?>,
-
-        series: <?= $seriesOptJs ?>
-
-      };
-
-      new google.visualization.LineChart(document.getElementById('curve_chart'))
-        .draw(data, options);
-    }
-  </script>
+        var chart = new google.visualization.LineChart(document.getElementById('chart_div'));
+        chart.draw(data, options);
+      }
+    </script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 15px; background: #f9f9f9; }
+        #chart_div { width: 100%; height: 550px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }
+    </style>
 </head>
 <body>
-  <div id="curve_chart" style="width:1700px; height:700px"></div>
+    <div id="chart_div"></div>
 </body>
 </html>
+<?php
+$html_output = ob_get_clean();
+
+// ---------------------------------------------------------
+// 6. SOVRASCRITTURA CACHE ED EROGAZIONE
+// ---------------------------------------------------------
+// Scrive o sovrascrive l'unico file di cache corrispondente all'hash
+file_put_contents($cache_file, $html_output, LOCK_EX);
+
+header('Content-Type: text/html; charset=utf-8');
+echo $html_output;
+exit;

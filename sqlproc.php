@@ -1,5 +1,5 @@
 <?php
-// sqlproc.php
+// sqlproc.php[cite: 3]
 // Data processing and caching engine.
 //
 // Delta modes:
@@ -188,6 +188,16 @@ $cache_key = md5(
 
 $cache_path = "$cache_dir/$q-$cache_key";
 $cache_axis_path = "$cache_path.axis.json";
+
+// Selective Cache Purge: clear cache files for current view if requested
+if (isset($_GET['purge']) || isset($_GET['nocache'])) {
+    if (file_exists($cache_path)) {
+        @unlink($cache_path);
+    }
+    if (file_exists($cache_axis_path)) {
+        @unlink($cache_axis_path);
+    }
+}
 
 // Serve historical requests directly from disk cache if present
 if (

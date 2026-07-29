@@ -96,13 +96,13 @@ $q_mode_d = build_q_param($dt, 'd');
 $q_mode_w = build_q_param($dt, 'w');
 $q_mode_m = build_q_param($dt, 'm');
 
-// Format date display label
+// Format date display label in English
 if ($current_mode === 'w') {
     $end_w = clone $dt;
     $end_w->modify('+6 days');
-    $date_label = "Settimana " . $dt->format('W/Y') . " (" . $dt->format('d/m') . " - " . $end_w->format('d/m') . ")";
+    $date_label = "Week " . $dt->format('W/Y') . " (" . $dt->format('d/m') . " - " . $end_w->format('d/m') . ")";
 } else if ($current_mode === 'm') {
-    $date_label = "Mese " . $dt->format('m/Y');
+    $date_label = "Month " . $dt->format('m/Y');
 } else {
     $date_label = $dt->format('d/m/Y');
 }
@@ -199,7 +199,7 @@ $vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);
 $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 ?>
 <!doctype html>
-<html lang="it">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
@@ -275,7 +275,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
         legend: { position: 'top' },
 
         hAxis: {
-          title: "Data/Ora",
+          title: "Date / Time",
           slantedText: true,
           slantedTextAngle: 90
         },
@@ -295,13 +295,13 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 
   <!-- Navigation Toolbar -->
   <div class="nav-toolbar">
-    <a href="?q=<?= $q_prev ?>" class="nav-btn" title="Precedente">&laquo;</a>
+    <a href="?q=<?= $q_prev ?>" class="nav-btn" title="Previous">&laquo;</a>
     <?php if ($is_future): ?>
-      <span class="nav-btn disabled" title="Periodo futuro non disponibile">&raquo;</span>
+      <span class="nav-btn disabled" title="Future period not available">&raquo;</span>
     <?php else: ?>
-      <a href="?q=<?= $q_next ?>" class="nav-btn" title="Successivo">&raquo;</a>
+      <a href="?q=<?= $q_next ?>" class="nav-btn" title="Next">&raquo;</a>
     <?php endif; ?>
-    <a href="?q=<?= $q_act ?>" class="nav-btn nav-btn-act" title="Data Attuale">ACT</a>
+    <a href="?q=<?= $q_act ?>" class="nav-btn nav-btn-act" title="Current Date">ACT</a>
     &nbsp;|
     <a href="?q=<?= $q_mode_d ?>" class="nav-btn <?= $current_mode === 'd' ? 'active' : '' ?>">DAY</a>
     <a href="?q=<?= $q_mode_w ?>" class="nav-btn <?= $current_mode === 'w' ? 'active' : '' ?>">WEEK</a>

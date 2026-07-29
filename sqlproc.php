@@ -1,5 +1,5 @@
 <?php
-// sqlproc.php - Data processing and caching engine with differential mode support
+// sqlproc.php - Data processing and caching engine with differential mode & forward-fill support
 
 // Load local.php dynamically from current working directory
 $local_config = getcwd() . '/local.php';
@@ -255,40 +255,40 @@ foreach ($seriesKeys as $k) {
   $prevRaw[$k] = null;
 }
 
-// Pre-fetch last known values before $sds for delta columns to ensure seamless continuity
+// Pre-fetch last known values before $sds for all columns to guarantee continuity
 for ($i = 0; $i < count($tab); $i++) {
-  if (!empty($tab[$i]["delta"])) {
-    $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
-    $whereInit = "epoch < $sds";
+  $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
+  $whereInit = "epoch < $sds";
 
-    if (isset($tab[$i]["device"])) {
-      $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
-      $whereInit .= " AND device = '$dev'";
-    }
-
-    $colsToFetch = [];
-    foreach ($tab[$i]["cols"] as $col) {
-      if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
-        $colsToFetch[] = "`$col`";
-      } else {
-        $colsToFetch[] = "($col)";
-      }
-    }
-
-    $sqlInit = "SELECT " . implode(", ", $colsToFetch) . " FROM `$tbl` WHERE $whereInit ORDER BY epoch DESC LIMIT 1";
-    $resInit = mysqli_query($conn, $sqlInit);
-
-    if ($resInit && $rowInit = mysqli_fetch_row($resInit)) {
-      foreach ($tab[$i]["cols"] as $colIndex => $col) {
-        $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
-        $key = "t{$i}__{$safeCol}_{$colIndex}";
-        if (isset($rowInit[$colIndex]) && $rowInit[$colIndex] !== null) {
-          $prevRaw[$key] = (float)$rowInit[$colIndex];
-        }
-      }
-    }
-    if ($resInit) mysqli_free_result($resInit);
+  if (isset($tab[$i]["device"])) {
+    $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
+    $whereInit .= " AND device = '$dev'";
   }
+
+  $colsToFetch = [];
+  foreach ($tab[$i]["cols"] as $col) {
+    if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
+      $colsToFetch[] = "`$col`";
+    } else {
+      $colsToFetch[] = "($col)";
+    }
+  }
+
+  $sqlInit = "SELECT " . implode(", ", $colsToFetch) . " FROM `$tbl` WHERE $whereInit ORDER BY epoch DESC LIMIT 1";
+  $resInit = @mysqli_query($conn, $sqlInit);
+
+  if ($resInit && $rowInit = mysqli_fetch_row($resInit)) {
+    foreach ($tab[$i]["cols"] as $colIndex => $col) {
+      $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
+      $key = "t{$i}__{$safeCol}_{$colIndex}";
+      if (isset($rowInit[$colIndex]) && $rowInit[$colIndex] !== null) {
+        $valInit = (float)$rowInit[$colIndex];
+        $prevRaw[$key] = $valInit;
+        $last[$key]    = $valInit;
+      }
+    }
+  }
+  if ($resInit) mysqli_free_result($resInit);
 }
 
 $nagg = 0;
@@ -319,20 +319,13 @@ while ($row = mysqli_fetch_assoc($res)) {
         if ($prevRaw[$k] !== null) {
           $delta = $currVal - $prevRaw[$k];
           if ($delta < 0) {
-            // Counter reset or noise, take current value
-            $delta = $currVal;
+            $delta = $currVal; // Counter reset
           }
           $acc[$k] += $delta;
-          $cnt[$k] += 1;
-        } else {
-          // Absolute fallback if no previous reading exists anywhere in DB
-          $acc[$k] += 0.0;
           $cnt[$k] += 1;
         }
         $prevRaw[$k] = $currVal;
       } else {
-        $last[$k] = $currVal;
-        $seen[$k] = true;
         $acc[$k] += $currVal;
         $cnt[$k] += 1;
       }
@@ -350,10 +343,20 @@ while ($row = mysqli_fetch_assoc($res)) {
     );
 
     foreach ($seriesKeys as $k) {
-      if ($seriesDeltas[$k]) {
-        $m = $cnt[$k] ? $acc[$k] : null;
+      if ($cnt[$k] > 0) {
+        if ($seriesDeltas[$k]) {
+          $m = $acc[$k];
+        } else {
+          $m = $acc[$k] / $cnt[$k];
+        }
+        $last[$k] = $m;
       } else {
-        $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
+        // Sample-and-hold forward fill for standard metrics, or 0.0 delta for differential metrics
+        if ($seriesDeltas[$k]) {
+          $m = 0.0;
+        } else {
+          $m = $last[$k];
+        }
       }
 
       if ($m === null) {
@@ -394,10 +397,18 @@ if ($nagg > 0 && $lastEpochInBucket !== null) {
   );
 
   foreach ($seriesKeys as $k) {
-    if ($seriesDeltas[$k]) {
-      $m = $cnt[$k] ? $acc[$k] : null;
+    if ($cnt[$k] > 0) {
+      if ($seriesDeltas[$k]) {
+        $m = $acc[$k];
+      } else {
+        $m = $acc[$k] / $cnt[$k];
+      }
     } else {
-      $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
+      if ($seriesDeltas[$k]) {
+        $m = 0.0;
+      } else {
+        $m = $last[$k];
+      }
     }
 
     if ($m === null) {

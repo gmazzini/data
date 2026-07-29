@@ -1,5 +1,5 @@
 <?php
-// sqlgraph.php - Chart rendering script with compact navigation toolbar
+// sqlgraph.php - Chart rendering script with compact navigation toolbar[cite: 4]
 
 // Load local.php dynamically from current working directory
 $local_config = getcwd() . '/local.php';
@@ -95,6 +95,9 @@ $q_act = build_q_param($dt_max, $current_mode);
 $q_mode_d = build_q_param($dt, 'd');
 $q_mode_w = build_q_param($dt, 'w');
 $q_mode_m = build_q_param($dt, 'm');
+
+// Calculate purge cache parameter
+$q_purge = "?q=" . $q . "&purge=1";
 
 // Format date display label in English
 if ($current_mode === 'w') {
@@ -306,6 +309,8 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     <a href="?q=<?= $q_mode_d ?>" class="nav-btn <?= $current_mode === 'd' ? 'active' : '' ?>">DAY</a>
     <a href="?q=<?= $q_mode_w ?>" class="nav-btn <?= $current_mode === 'w' ? 'active' : '' ?>">WEEK</a>
     <a href="?q=<?= $q_mode_m ?>" class="nav-btn <?= $current_mode === 'm' ? 'active' : '' ?>">MONTH</a>
+    &nbsp;|
+    <a href="<?= $q_purge ?>" class="nav-btn" title="Purge cache & reload view">&#128259;</a>
     <span class="nav-date-label"><?= htmlspecialchars($date_label, ENT_QUOTES, 'UTF-8') ?></span>
   </div>
 

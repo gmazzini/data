@@ -1,7 +1,7 @@
 <?php
-// sqlproc.php - Data extraction and processing module
+// sqlproc.php - Data processing and caching engine
 
-// Always load local.php from the current working directory
+// Load local.php dynamically from the current working directory
 $local_config = getcwd() . '/local.php';
 if (file_exists($local_config)) {
     require_once $local_config;
@@ -10,84 +10,393 @@ if (file_exists($local_config)) {
     die("Error: Unable to find local.php in current working directory (" . getcwd() . ")\n");
 }
 
-// PDO database connection singleton
-function get_db(): PDO {
-    static $pdo = null;
-    if ($pdo === null) {
-        global $db_host, $db_user, $db_pass, $db_name;
-        $dsn = "mysql:host={$db_host};dbname={$db_name};charset=utf8mb4";
-        $options = [
-            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES   => false,
-        ];
-        try {
-            $pdo = new PDO($dsn, $db_user, $db_pass, $options);
-        } catch (PDOException $e) {
-            http_response_code(500);
-            die("Database connection error: " . $e->getMessage() . "\n");
-        }
-    }
-    return $pdo;
+// Ensure cache directory exists
+if (isset($cache_dir) && !is_dir($cache_dir)) {
+  @mkdir($cache_dir, 0775, true);
 }
 
-// Extract sensor data in memory without temporary files
-function get_sensors_data(string $from, string $to): array {
-    global $tab, $points;
-    $pdo = get_db();
+// Default query period
+if (!isset($q)) {
+  $q = date("Y\\dz");
+}
 
-    $all_data = [];
+// Parse date range according to period format
+if (substr($q, 4, 1) == "d") {
+  $aux = date_create_from_format("Yz", substr($q, 0, 4) . substr($q, 5));
+  $ds  = date_format($aux, "Y/m/d 00:00:00");
+  $de  = date_format($aux, "Y/m/d 23:59:59");
+  $q   = sprintf("%04dd%03d", substr($q, 0, 4), substr($q, 5));
+} else if (substr($q, 4, 1) == "w") {
+  $aux = date_create();
+  date_isodate_set($aux, substr($q, 0, 4), substr($q, 5));
+  $ds  = date_format($aux, "Y/m/d 00:00:00");
+  date_add($aux, date_interval_create_from_date_string("6 days"));
+  $de  = date_format($aux, "Y/m/d 23:59:59");
+  $q   = sprintf("%04dw%02d", substr($q, 0, 4), substr($q, 5));
+} else if (substr($q, 4, 1) == "m") {
+  $aux = date_create_from_format("Yn", substr($q, 0, 4) . substr($q, 5));
+  $ds  = date_format($aux, "Y/m/01 00:00:00");
+  $de  = date_format($aux, "Y/m/t 23:59:59");
+  $q   = sprintf("%04dm%02d", substr($q, 0, 4), substr($q, 5));
+} else {
+  $aux = date_create();
+  $ds  = date_format($aux, "Y/m/d 00:00:00");
+  $de  = date_format($aux, "Y/m/d 23:59:59");
+  $q   = date("Y\\dz");
+  $q   = sprintf("%04dd%03d", substr($q, 0, 4), substr($q, 5));
+}
 
-    // Loop through sensors defined in local.php $tab array
-    foreach ($tab as $index => $sensor) {
-        $table  = preg_replace('/[^a-zA-Z0-9_]/', '', $sensor['table']);
-        $device = $sensor['device'];
-        $col    = preg_replace('/[^a-zA-Z0-9_]/', '', isset($sensor['cols'][0]) ? $sensor['cols'][0] : 'temperature');
+// Determine active period key to check if request is live or historical
+if (substr($q, 4, 1) == "d") {
+  $xq = date("Y\\dz");
+  $vq = sprintf("%04dd%03d", substr($xq, 0, 4), substr($xq, 5));
+} else if (substr($q, 4, 1) == "w") {
+  $xq = date("Y\\wW");
+  $vq = sprintf("%04dw%02d", substr($xq, 0, 4), substr($xq, 5));
+} else if (substr($q, 4, 1) == "m") {
+  $xq = date("Y\\mn");
+  $vq = sprintf("%04dm%02d", substr($xq, 0, 4), substr($xq, 5));
+} else {
+  $vq = $q;
+}
 
-        // Candidate timestamp column names
-        $time_cols_to_try = ['timestamp', 'date_time', 'datetime', 'time'];
-        $stmt = null;
+$is_live = ($q == $vq);
 
-        foreach ($time_cols_to_try as $t_col) {
-            try {
-                $sql = "SELECT `{$t_col}` AS t_time, `{$col}` AS t_val 
-                        FROM `{$table}` 
-                        WHERE device = :device 
-                          AND `{$t_col}` BETWEEN :from AND :to 
-                        ORDER BY `{$t_col}` ASC";
+$sds = strtotime($ds);
+$sde = strtotime($de);
+$dds = "from day:".date("z",$sds).":".date("w",$sds)." week:".date("W",$sds)." month:".date("m",$sds);
+$dde = "to day:".date("z",$sde).":".date("w",$sde)." week:".date("W",$sde)." month:".date("m",$sde);
 
-                $stmt = $pdo->prepare($sql);
-                $stmt->bindValue(':device', $device, PDO::PARAM_STR);
-                $stmt->bindValue(':from', $from, PDO::PARAM_STR);
-                $stmt->bindValue(':to', $to, PDO::PARAM_STR);
-                $stmt->execute();
-                break;
-            } catch (PDOException $e) {
-                continue;
-            }
-        }
+$axisRange = [
+  0 => ['min' => 0, 'max' => 1],
+  1 => ['min' => 0, 'max' => 1],
+];
 
-        if (!$stmt) {
-            continue;
-        }
+$axisStats = [
+  0 => ['min' => null, 'max' => null],
+  1 => ['min' => null, 'max' => null],
+];
 
-        $rows = $stmt->fetchAll();
-        $count = count($rows);
-        $max_p = (isset($points) && $points > 0) ? $points : 1000;
-        $step  = ($count > $max_p) ? ceil($count / $max_p) : 1;
+// Unique cache key generation
+$cache_key = md5(json_encode($tab) . "|" . $points . "|" . $q);
+$cache_path = "$cache_dir/$q-$cache_key";
+$cache_axis_path = "$cache_path.axis.json";
 
-        // Downsample data points in RAM to fit $points limit
-        for ($i = 0; $i < $count; $i += $step) {
-            $t = $rows[$i]['t_time'];
-            $v = $rows[$i]['t_val'] !== null ? (float)$rows[$i]['t_val'] : null;
+// Serve historical requests directly from disk cache if present
+if (!$is_live && file_exists($cache_path) && file_exists($cache_axis_path)) {
+  $axisJson = file_get_contents($cache_axis_path);
+  $axisTmp = json_decode($axisJson, true);
 
-            if (!isset($all_data[$t])) {
-                $all_data[$t] = array_fill(0, count($tab), null);
-            }
-            $all_data[$t][$index] = $v;
-        }
+  if (is_array($axisTmp)) {
+    $axisRange = $axisTmp;
+  }
+
+  echo file_get_contents($cache_path);
+  return;
+}
+
+$conn = mysqli_connect($db_host, $db_user, $db_pass, $db_name);
+if (!$conn) {
+  echo "[]";
+  return;
+}
+
+@mysqli_set_charset($conn, "utf8mb4");
+
+// Build UNION SQL query
+$unionParts = [];
+for ($i = 0; $i < count($tab); $i++) {
+  $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
+
+  $where = "epoch BETWEEN $sds AND $sde";
+
+  if (isset($tab[$i]["device"])) {
+    $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
+    $where .= " AND device = '$dev'";
+  }
+
+  $unionParts[] = "SELECT epoch FROM $tbl WHERE $where";
+}
+$unionSql = implode("\n  UNION\n  ", $unionParts);
+
+$selectCols = ["e.epoch"];
+$joins      = [];
+$seriesKeys = [];
+$seriesAxes = [];
+
+for ($i = 0; $i < count($tab); $i++) {
+  $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
+  $als = "t$i";
+
+  $joinCond = "$als.epoch = e.epoch";
+
+  if (isset($tab[$i]["device"])) {
+    $dev = mysqli_real_escape_string($conn, $tab[$i]["device"]);
+    $joinCond .= " AND $als.device = '$dev'";
+  }
+
+  $joins[] = "LEFT JOIN $tbl $als ON $joinCond";
+
+  foreach ($tab[$i]["cols"] as $colIndex => $col) {
+    $safeCol = preg_replace('/[^A-Za-z0-9_]/', '_', $col);
+    $key = "{$als}__{$safeCol}_{$colIndex}";
+    $seriesIndex = count($seriesKeys);
+
+    $seriesKeys[] = $key;
+
+    $axis = 0;
+    if (isset($seriesOpt[$seriesIndex]['targetAxisIndex'])) {
+      $axis = (int)$seriesOpt[$seriesIndex]['targetAxisIndex'];
+    }
+    $seriesAxes[$key] = $axis;
+
+    if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
+      $selectCols[] = "$als.`$col` AS `$key`";
+      continue;
     }
 
-    ksort($all_data);
-    return $all_data;
+    $expr = preg_replace_callback(
+      '/\b([A-Za-z_][A-Za-z0-9_]*)\b/',
+      function($m) use ($als) {
+        $w = strtolower($m[1]);
+        static $skip = [
+          'null','true','false',
+          'abs','avg','count','sum','min','max',
+          'if','ifnull','coalesce','nullif',
+          'round','floor','ceil',
+          'date','now','unix_timestamp',
+          'case','when','then','else','end',
+          'over','partition','by',
+          'rows','range','groups',
+          'current_row','unbounded',
+          'preceding','following'
+        ];
+        if (in_array($w, $skip, true)) return $m[1];
+        return $als . ".`" . $m[1] . "`";
+      },
+      $col
+    );
+
+    $selectCols[] = "($expr) AS `$key`";
+  }
+}
+
+$sqlCount = "
+SELECT COUNT(*) AS N
+FROM (
+  $unionSql
+) e
+";
+
+$sqlData = "
+SELECT " . implode(", ", $selectCols) . "
+FROM (
+  $unionSql
+) e
+" . implode("\n", $joins) . "
+ORDER BY e.epoch
+";
+
+$resN = mysqli_query($conn, $sqlCount);
+if (!$resN) {
+  mysqli_close($conn);
+  if (!$is_live) {
+    file_put_contents($cache_axis_path, json_encode($axisRange));
+  }
+  echo "[]";
+  return;
+}
+
+$rowN = mysqli_fetch_assoc($resN);
+mysqli_free_result($resN);
+
+$N = (int)$rowN["N"];
+if ($N <= 0) {
+  mysqli_close($conn);
+
+  if (!$is_live) {
+    file_put_contents($cache_path, "[]");
+    file_put_contents($cache_axis_path, json_encode($axisRange));
+  }
+
+  echo "[]";
+  return;
+}
+
+$agg = max(1, (int)ceil($N / $points));
+
+// Live queries stream directly in RAM (php://temp) to avoid disk writes
+$fp = $is_live ? fopen("php://temp", "w+") : fopen($cache_path, "w");
+if (!$fp) {
+  mysqli_close($conn);
+
+  if (!$is_live) {
+    file_put_contents($cache_axis_path, json_encode($axisRange));
+  }
+  echo "[]";
+  return;
+}
+
+$last = [];
+$seen = [];
+$acc  = [];
+$cnt  = [];
+
+foreach ($seriesKeys as $k) {
+  $last[$k] = null;
+  $seen[$k] = false;
+  $acc[$k]  = 0.0;
+  $cnt[$k]  = 0;
+}
+
+$nagg = 0;
+$lastEpochInBucket = null;
+
+$res = mysqli_query($conn, $sqlData);
+if (!$res) {
+  fclose($fp);
+  if (!$is_live) {
+    @unlink($cache_path);
+    @unlink($cache_axis_path);
+    file_put_contents($cache_axis_path, json_encode($axisRange));
+  }
+  mysqli_close($conn);
+  echo "[]";
+  return;
+}
+
+while ($row = mysqli_fetch_assoc($res)) {
+  $epoch = (int)$row["epoch"];
+  $lastEpochInBucket = $epoch;
+
+  foreach ($seriesKeys as $k) {
+    if ($row[$k] !== null) {
+      $last[$k] = (float)$row[$k];
+      $seen[$k] = true;
+    }
+
+    $v = ($last[$k] !== null) ? $last[$k] : null;
+
+    if ($v !== null) {
+      $acc[$k] += $v;
+      $cnt[$k] += 1;
+    }
+  }
+
+  $nagg++;
+
+  if ($nagg >= $agg) {
+    $dd = $lastEpochInBucket;
+    $out = [];
+
+    $out[] = sprintf("'%s%s%s %s%s'",
+      date("y", $dd), date("m", $dd), date("d", $dd), date("H", $dd), date("i", $dd)
+    );
+
+    foreach ($seriesKeys as $k) {
+      $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
+
+      if ($m === null) {
+        $out[] = "null";
+      } else {
+        $axis = $seriesAxes[$k] ?? 0;
+
+        if (!isset($axisStats[$axis])) {
+          $axisStats[$axis] = ['min' => null, 'max' => null];
+        }
+
+        if ($axisStats[$axis]['min'] === null || $m < $axisStats[$axis]['min']) {
+          $axisStats[$axis]['min'] = $m;
+        }
+
+        if ($axisStats[$axis]['max'] === null || $m > $axisStats[$axis]['max']) {
+          $axisStats[$axis]['max'] = $m;
+        }
+
+        $out[] = sprintf("%9.5f", $m);
+      }
+
+      $acc[$k] = 0.0;
+      $cnt[$k] = 0;
+    }
+
+    fprintf($fp, "[%s],\n", implode(", ", $out));
+    $nagg = 0;
+  }
+}
+
+if ($nagg > 0 && $lastEpochInBucket !== null) {
+  $dd = $lastEpochInBucket;
+  $out = [];
+
+  $out[] = sprintf("'%s%s%s %s%s'",
+    date("y", $dd), date("m", $dd), date("d", $dd), date("H", $dd), date("i", $dd)
+  );
+
+  foreach ($seriesKeys as $k) {
+    $m = $cnt[$k] ? ($acc[$k] / $cnt[$k]) : null;
+
+    if ($m === null) {
+      $out[] = "null";
+    } else {
+      $axis = $seriesAxes[$k] ?? 0;
+
+      if (!isset($axisStats[$axis])) {
+        $axisStats[$axis] = ['min' => null, 'max' => null];
+      }
+
+      if ($axisStats[$axis]['min'] === null || $m < $axisStats[$axis]['min']) {
+        $axisStats[$axis]['min'] = $m;
+      }
+
+      if ($axisStats[$axis]['max'] === null || $m > $axisStats[$axis]['max']) {
+        $axisStats[$axis]['max'] = $m;
+      }
+
+      $out[] = sprintf("%9.5f", $m);
+    }
+  }
+
+  fprintf($fp, "[%s],\n", implode(", ", $out));
+}
+
+mysqli_free_result($res);
+mysqli_close($conn);
+
+// Compute axis bounds
+for ($axis = 0; $axis <= 1; $axis++) {
+  if (
+    isset($axisStats[$axis]) &&
+    $axisStats[$axis]['min'] !== null &&
+    $axisStats[$axis]['max'] !== null
+  ) {
+    $min = (float)$axisStats[$axis]['min'];
+    $max = (float)$axisStats[$axis]['max'];
+
+    if ($min == $max) {
+      $min = $min - 1;
+      $max = $max + 1;
+    }
+
+    $axisRange[$axis] = [
+      'min' => $min,
+      'max' => $max
+    ];
+  } else {
+    $axisRange[$axis] = [
+      'min' => 0,
+      'max' => 1
+    ];
+  }
+}
+
+// Deliver response directly from memory for live data or save to cache for past periods
+if ($is_live) {
+  rewind($fp);
+  echo stream_get_contents($fp);
+  fclose($fp);
+} else {
+  fclose($fp);
+  file_put_contents($cache_axis_path, json_encode($axisRange));
+  echo file_get_contents($cache_path);
 }

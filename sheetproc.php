@@ -85,7 +85,6 @@ foreach ($headers as $idx => $header_val) {
     if ($idx === 0) continue; // Column A is Date
     $h_clean = trim($header_val);
 
-    // Matches formats like 01:00, 1:00, 02:15, 02:15:00
     if (preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $h_clean, $m)) {
         $sec = isset($m[3]) ? $m[3] : "00";
         $col_time_map[$idx] = sprintf("%02d:%02d:%02d", $m[1], $m[2], $sec);
@@ -93,6 +92,12 @@ foreach ($headers as $idx => $header_val) {
 }
 
 $tz_rome = new DateTimeZone('Europe/Rome');
+
+// Check if target date is the October DST Fall-Back day (25-hour day)
+$dt_start = new DateTime("$target_date 00:00:00", $tz_rome);
+$dt_end   = new DateTime("$target_date 23:00:00", $tz_rome);
+$is_dst_fallback_day = ($dt_start->format('I') == 1 && $dt_end->format('I') == 0);
+
 $output = array();
 
 // Iterate over data rows
@@ -113,13 +118,22 @@ for ($i = 1; $i < count($lines); $i++) {
 
             $val = floatval(str_replace(',', '.', $val_raw));
 
-            // Convert Italian Local Time to UTC Unix Timestamp
             try {
-                $dt = new DateTime("$target_date $time_str", $tz_rome);
-                $epoch = $dt->getTimestamp();
+                // Handle the repeated 02:00-02:45 hour on October DST transition day
+                if ($is_dst_fallback_day && strpos($time_str, '02:') === 0) {
+                    if ($col_idx < 97) {
+                        // Standard columns (1st 02:00 hour) -> CEST (UTC+2)
+                        $dt = new DateTime("$target_date $time_str+02:00");
+                    } else {
+                        // Extra CT-CW columns (2nd 02:00 hour) -> CET (UTC+1)
+                        $dt = new DateTime("$target_date $time_str+01:00");
+                    }
+                } else {
+                    $dt = new DateTime("$target_date $time_str", $tz_rome);
+                }
 
                 $output[] = array(
-                    "epoch" => $epoch,
+                    "epoch" => $dt->getTimestamp(),
                     "value" => $val
                 );
             } catch (Exception $e) {

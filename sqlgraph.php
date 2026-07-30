@@ -120,7 +120,13 @@ $mytitle = $mytitle ?? "";
 $header = array_merge(["x"], $labels);
 
 ob_start();
-include __DIR__ . "/sqlproc.php";
+$local_sqlproc = getcwd() . '/sqlproc.php';
+if (file_exists($local_sqlproc)) {
+    include $local_sqlproc;
+} else {
+    header('HTTP/1.1 500 Internal Server Error');
+    die("Errore: 'sqlproc.php' non trovato nella directory corrente (" . getcwd() . ")." . PHP_EOL);
+}
 $dataRows = ob_get_clean();
 
 $dds = $dds ?? "";

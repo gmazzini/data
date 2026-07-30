@@ -1,18 +1,22 @@
 <?php
-// Include local configuration
+// Include local configuration file containing sheet parameters
 include "/home/www/sensori/local.php";
 
-// Set default fallback values if not specified in local.php
-if (!isset($pun_sheet_id))    $pun_sheet_id    = "1RF4N-T2NR2UHai70AzTzwuLXowkLlOQWvFyb8AaE1xg";
-if (!isset($pun_sheet_range)) $pun_sheet_range = "A1:Z1000";
-
-// Path to access token managed by the external pipeline
+// Path to access token managed by the external C pipeline
 $token_file = "/home/www/data/google_access_token";
 
-// Read access token directly from file
-if (!file_exists($token_file)) exit(0);
+if (!file_exists($token_file)) {
+    header('Content-Type: application/json');
+    echo json_encode(array());
+    exit(0);
+}
+
 $access_token = trim(file_get_contents($token_file));
-if (empty($access_token)) exit(0);
+if (empty($access_token)) {
+    header('Content-Type: application/json');
+    echo json_encode(array());
+    exit(0);
+}
 
 // Determine target date from CLI argument or HTTP GET parameter
 $target_date_raw = "";
@@ -28,71 +32,83 @@ if (empty($target_date_raw)) {
     $target_date = date("Y-m-d", strtotime($target_date_raw));
 }
 
-// Fetch sheet data via Google Sheets REST API v4 using the Bearer token
-$api_url = "https://sheets.googleapis.com/v4/spreadsheets/" . rawurlencode($pun_sheet_id) . "/values/" . rawurlencode($pun_sheet_range);
+// Normalize various date formats (DD/MM/YYYY, DD/MM/YY, DD/MM, YYYY-MM-DD) to YYYY-MM-DD
+function parse_date_to_ymd($date_str) {
+    $date_str = trim($date_str);
+    if (empty($date_str)) return false;
 
-$ch = curl_init($api_url);
+    if (preg_match('/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/', $date_str, $m)) {
+        $day   = intval($m[1]);
+        $month = intval($m[2]);
+        if (isset($m[3])) {
+            $year = intval($m[3]);
+            if ($year < 100) $year += 2000;
+        } else {
+            $year = intval(date("Y"));
+        }
+        return sprintf("%04d-%02d-%02d", $year, $month, $day);
+    }
+
+    $epoch = strtotime(str_replace('/', '-', $date_str));
+    if ($epoch) return date("Y-m-d", $epoch);
+
+    return false;
+}
+
+// Fetch CSV export directly using gid to target the exact sheet tab with Bearer authorization
+$csv_url = "https://docs.google.com/spreadsheets/d/" . rawurlencode($pun_sheet_id) . "/export?format=csv&gid=" . rawurlencode($pun_sheet_gid);
+
+$ch = curl_init($csv_url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
 curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-    "Authorization: Bearer " . $access_token,
-    "Content-Type: application/json"
+    "Authorization: Bearer " . $access_token
 ));
 curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
 curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
-$sheet_res = curl_exec($ch);
+$csv_data = curl_exec($ch);
 curl_close($ch);
 
-if ($sheet_res === false || $sheet_res == "") exit(0);
+if ($csv_data === false || empty($csv_data) || strpos($csv_data, "<!DOCTYPE html") !== false) {
+    header('Content-Type: application/json');
+    echo json_encode(array());
+    exit(0);
+}
 
-$sheet_data = json_decode($sheet_res, true);
-if (!isset($sheet_data["values"]) || !is_array($sheet_data["values"])) exit(0);
-
+$lines = explode("\n", $csv_data);
 $output = array();
 
-// Parse rows to extract matching date records
-foreach ($sheet_data["values"] as $row) {
-    if (empty($row) || count($row) < 2) continue;
+// Parse CSV rows
+foreach ($lines as $line) {
+    $line = trim($line);
+    if (empty($line)) continue;
 
-    $row_date_str = trim($row[0]);
-    $row_epoch = strtotime(str_replace('/', '-', $row_date_str));
-    if (!$row_epoch) continue;
+    $row = str_getcsv($line);
+    if (empty($row) || count($row) < 25) continue; // Requires Date + 24 hourly columns
 
-    $row_date = date("Y-m-d", $row_epoch);
+    $row_date = parse_date_to_ymd($row[0]);
+    if (!$row_date) continue;
 
+    // Extract 24 hourly PUN values (columns B to Y) matching the target date
     if ($row_date === $target_date) {
+        for ($h = 0; $h < 24; $h++) {
+            $val_raw = trim($row[$h + 1]);
+            if ($val_raw === "") continue;
 
-        // Vertical layout: [Date, Hour (1-24), Value]
-        if (count($row) == 3 && is_numeric(trim($row[1]))) {
-            $hour = intval($row[1]) - 1;
-            $val  = floatval(str_replace(',', '.', trim($row[2])));
+            $val = floatval(str_replace(',', '.', $val_raw));
+            $point_epoch = strtotime("$target_date $h:00:00 UTC");
 
-            $point_epoch = strtotime("$target_date $hour:00:00 UTC");
             $output[] = array(
                 "epoch" => $point_epoch,
                 "value" => $val
             );
-        } 
-        // Horizontal layout: [Date, H01, H02, ..., H24]
-        elseif (count($row) >= 25) {
-            for ($h = 0; $h < 24; $h++) {
-                $val_raw = trim($row[$h + 1]);
-                if ($val_raw === "") continue;
-
-                $val = floatval(str_replace(',', '.', $val_raw));
-                $point_epoch = strtotime("$target_date $h:00:00 UTC");
-
-                $output[] = array(
-                    "epoch" => $point_epoch,
-                    "value" => $val
-                );
-            }
-            break;
         }
+        break;
     }
 }
 
-// Output formatted JSON array for sqldata
+// Output JSON result
 header('Content-Type: application/json');
 echo json_encode($output);
 ?>

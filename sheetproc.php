@@ -18,26 +18,17 @@ if (empty($access_token)) {
     exit(0);
 }
 
-// Determine target date from CLI argument or HTTP GET parameter
-$target_date_raw = "";
-if (isset($_GET['date'])) {
-    $target_date_raw = trim($_GET['date']);
-} elseif (isset($argv[1])) {
-    $target_date_raw = trim($argv[1]);
-}
+// Convert input (String date OR numeric Unix Epoch) to YYYY-MM-DD
+function parse_to_ymd($input) {
+    $input = trim($input);
+    if (empty($input)) return false;
 
-if (empty($target_date_raw)) {
-    $target_date = date("Y-m-d");
-} else {
-    $target_date = date("Y-m-d", strtotime($target_date_raw));
-}
+    // If sqlgraph passed a numeric Unix Timestamp (e.g. 1785362400)
+    if (is_numeric($input) && strlen($input) >= 9) {
+        return date("Y-m-d", intval($input));
+    }
 
-// Normalize date string to YYYY-MM-DD
-function parse_date_to_ymd($date_str) {
-    $date_str = trim($date_str);
-    if (empty($date_str)) return false;
-
-    if (preg_match('/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/', $date_str, $m)) {
+    if (preg_match('/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/', $input, $m)) {
         $day   = intval($m[1]);
         $month = intval($m[2]);
         $year  = isset($m[3]) ? intval($m[3]) : intval(date("Y"));
@@ -45,9 +36,26 @@ function parse_date_to_ymd($date_str) {
         return sprintf("%04d-%02d-%02d", $year, $month, $day);
     }
 
-    $epoch = strtotime(str_replace('/', '-', $date_str));
+    $epoch = strtotime(str_replace('/', '-', $input));
     return $epoch ? date("Y-m-d", $epoch) : false;
 }
+
+// Read parameters sent by sqlgraph or CLI
+$from_raw = $_GET['from'] ?? $_GET['start'] ?? $_GET['date_from'] ?? $_GET['date'] ?? ($argv[1] ?? null);
+$to_raw   = $_GET['to']   ?? $_GET['end']   ?? $_GET['date_to']   ?? ($argv[2] ?? null);
+
+$start_date = $from_raw ? parse_to_ymd($from_raw) : date("Y-m-d");
+$end_date   = $to_raw   ? parse_to_ymd($to_raw)   : $start_date;
+
+if ($start_date > $end_date) {
+    $tmp = $start_date;
+    $start_date = $end_date;
+    $end_date = $tmp;
+}
+
+// Epoch bounds for exact sqlgraph filtering
+$min_epoch = (is_numeric($from_raw) && strlen($from_raw) >= 9) ? intval($from_raw) : strtotime("$start_date 00:00:00 UTC");
+$max_epoch = (is_numeric($to_raw)   && strlen($to_raw)   >= 9) ? intval($to_raw)   : strtotime("$end_date 23:59:59 UTC");
 
 // Fetch CSV export directly from Google Sheets
 $csv_url = "https://docs.google.com/spreadsheets/d/" . rawurlencode($pun_sheet_id) . "/export?format=csv&gid=" . rawurlencode($pun_sheet_gid);
@@ -59,7 +67,7 @@ curl_setopt($ch, CURLOPT_HTTPHEADER, array(
     "Authorization: Bearer " . $access_token
 ));
 curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+curl_setopt($ch, CURLOPT_TIMEOUT, 15);
 
 $csv_data = curl_exec($ch);
 curl_close($ch);
@@ -77,12 +85,12 @@ if (count($lines) < 2) {
     exit(0);
 }
 
-// Parse Header Row (Row 1) to build a mapping of Column Index -> Local Time (HH:MM:SS)
+// Parse Header Row (Row 1) to build mapping: Column Index -> Local Time (HH:MM:SS)
 $headers = str_getcsv($lines[0]);
 $col_time_map = array();
 
 foreach ($headers as $idx => $header_val) {
-    if ($idx === 0) continue; // Column A is Date
+    if ($idx === 0) continue;
     $h_clean = trim($header_val);
 
     if (preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $h_clean, $m)) {
@@ -92,15 +100,9 @@ foreach ($headers as $idx => $header_val) {
 }
 
 $tz_rome = new DateTimeZone('Europe/Rome');
-
-// Check if target date is the October DST Fall-Back day (25-hour day)
-$dt_start = new DateTime("$target_date 00:00:00", $tz_rome);
-$dt_end   = new DateTime("$target_date 23:00:00", $tz_rome);
-$is_dst_fallback_day = ($dt_start->format('I') == 1 && $dt_end->format('I') == 0);
-
 $output = array();
 
-// Iterate over data rows
+// Iterate over data rows matching date range
 for ($i = 1; $i < count($lines); $i++) {
     $line = trim($lines[$i]);
     if (empty($line)) continue;
@@ -108,8 +110,15 @@ for ($i = 1; $i < count($lines); $i++) {
     $row = str_getcsv($line);
     if (empty($row)) continue;
 
-    $row_date = parse_date_to_ymd($row[0]);
-    if ($row_date === $target_date) {
+    $row_date = parse_to_ymd($row[0]);
+    if (!$row_date) continue;
+
+    if ($row_date >= $start_date && $row_date <= $end_date) {
+        
+        $dt_start = new DateTime("$row_date 00:00:00", $tz_rome);
+        $dt_end   = new DateTime("$row_date 23:00:00", $tz_rome);
+        $is_dst_fallback_day = ($dt_start->format('I') == 1 && $dt_end->format('I') == 0);
+
         foreach ($col_time_map as $col_idx => $time_str) {
             if (!isset($row[$col_idx])) continue;
 
@@ -119,37 +128,34 @@ for ($i = 1; $i < count($lines); $i++) {
             $val = floatval(str_replace(',', '.', $val_raw));
 
             try {
-                // Handle the repeated 02:00-02:45 hour on October DST transition day
                 if ($is_dst_fallback_day && strpos($time_str, '02:') === 0) {
-                    if ($col_idx < 97) {
-                        // Standard columns (1st 02:00 hour) -> CEST (UTC+2)
-                        $dt = new DateTime("$target_date $time_str+02:00");
-                    } else {
-                        // Extra CT-CW columns (2nd 02:00 hour) -> CET (UTC+1)
-                        $dt = new DateTime("$target_date $time_str+01:00");
-                    }
+                    $dt = new DateTime("$row_date $time_str" . ($col_idx < 97 ? "+02:00" : "+01:00"));
                 } else {
-                    $dt = new DateTime("$target_date $time_str", $tz_rome);
+                    $dt = new DateTime("$row_date $time_str", $tz_rome);
                 }
 
-                $output[] = array(
-                    "epoch" => $dt->getTimestamp(),
-                    "value" => $val
-                );
+                $point_epoch = $dt->getTimestamp();
+
+                // Exact filter based on sqlgraph window bounds
+                if ($point_epoch >= $min_epoch && $point_epoch <= $max_epoch) {
+                    $output[] = array(
+                        "epoch" => $point_epoch,
+                        "value" => $val
+                    );
+                }
             } catch (Exception $e) {
                 continue;
             }
         }
-        break;
     }
 }
 
-// Sort points chronologically by epoch
+// Sort all points chronologically by epoch
 usort($output, function($a, $b) {
     return $a['epoch'] <=> $b['epoch'];
 });
 
-// Output clean JSON format compatible with sqlgraph
+// Output clean JSON format
 header('Content-Type: application/json');
 echo json_encode($output) . PHP_EOL;
 ?>

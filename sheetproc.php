@@ -191,10 +191,10 @@ for ($i = 1; $i < count($lines); $i++) {
 
                 $epoch = $dt->getTimestamp();
 
-                // Format for sqlgraph.php engine (indexed by epoch)
+                // Format for sqlgraph.php engine
                 $tab_data[$epoch] = array($val);
 
-                // Format for direct JSON output
+                // Format for standalone JSON output
                 $json_data[] = array(
                     "epoch" => $epoch,
                     "value" => $val
@@ -209,7 +209,22 @@ for ($i = 1; $i < count($lines); $i++) {
 // Sort chronologically by timestamp key
 ksort($tab_data);
 
-// Populate global variables expected by sqlgraph engine
+// Export series definitions and data into $GLOBALS for sqlgraph.php
+$col_def = array("PUN");
+
+$GLOBALS['title']  = $GLOBALS['title']  ?? $title  ?? "Prezzo Unico Nazionale (PUN)";
+$GLOBALS['unit']   = $GLOBALS['unit']   ?? $unit   ?? "€/MWh";
+$GLOBALS['vlabel'] = $GLOBALS['vlabel'] ?? $vlabel ?? "€/MWh";
+
+$GLOBALS['names']  = $GLOBALS['names']  ?? $names  ?? $col_def;
+$GLOBALS['vars']   = $GLOBALS['vars']   ?? $vars   ?? $col_def;
+$GLOBALS['cols']   = $GLOBALS['cols']   ?? $cols   ?? $col_def;
+$GLOBALS['series'] = $GLOBALS['series'] ?? $series ?? $col_def;
+$GLOBALS['legend'] = $GLOBALS['legend'] ?? $legend ?? $col_def;
+
+$GLOBALS['tab']    = $tab_data;
+$GLOBALS['points'] = $tab_data;
+
 $tab    = $tab_data;
 $points = $tab_data;
 

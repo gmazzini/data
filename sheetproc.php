@@ -1,5 +1,5 @@
 <?php
-// 1. Load local.php exclusively from the current working directory
+// 1. Load local.php exclusively from current working directory
 $local_config = getcwd() . "/local.php";
 
 if (!file_exists($local_config)) {
@@ -9,7 +9,7 @@ if (!file_exists($local_config)) {
 
 include $local_config;
 
-// 2. Ensure Google Sheet ID and GID are defined in local.php
+// 2. Ensure Google Sheet ID and GID are defined
 $sheet_id  = $sheet_id  ?? $pun_sheet_id  ?? null;
 $sheet_gid = $sheet_gid ?? $pun_sheet_gid ?? null;
 
@@ -154,7 +154,8 @@ foreach ($headers as $idx => $header_val) {
 }
 
 $tz_rome = new DateTimeZone('Europe/Rome');
-$output = array();
+$tab_data  = array();
+$json_data = array();
 
 // Extract matching data points within date range
 for ($i = 1; $i < count($lines); $i++) {
@@ -188,8 +189,14 @@ for ($i = 1; $i < count($lines); $i++) {
                     $dt = new DateTime("$row_date $time_str", $tz_rome);
                 }
 
-                $output[] = array(
-                    "epoch" => $dt->getTimestamp(),
+                $epoch = $dt->getTimestamp();
+
+                // Format for sqlgraph.php engine (indexed by epoch)
+                $tab_data[$epoch] = array($val);
+
+                // Format for direct JSON output
+                $json_data[] = array(
+                    "epoch" => $epoch,
                     "value" => $val
                 );
             } catch (Exception $e) {
@@ -199,18 +206,21 @@ for ($i = 1; $i < count($lines); $i++) {
     }
 }
 
-// Sort data chronologically by timestamp
-usort($output, function($a, $b) {
-    return $a['epoch'] <=> $b['epoch'];
-});
+// Sort chronologically by timestamp key
+ksort($tab_data);
 
 // Populate global variables expected by sqlgraph engine
-$points = $output;
-$tab    = $output;
+$tab    = $tab_data;
+$points = $tab_data;
 
 // Output JSON when invoked directly via CLI or standalone HTTP request
 if (basename($_SERVER['SCRIPT_FILENAME'] ?? '') === basename(__FILE__)) {
     header('Content-Type: application/json');
-    echo json_encode($output) . PHP_EOL;
+
+    usort($json_data, function($a, $b) {
+        return $a['epoch'] <=> $b['epoch'];
+    });
+
+    echo json_encode($json_data) . PHP_EOL;
 }
 ?>

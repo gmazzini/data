@@ -1,8 +1,24 @@
 <?php
-// Include local configuration file from /home/www/pun/local.php
-include "/home/www/pun/local.php";
+// 1. Load local.php exclusively from the current working directory
+$local_config = getcwd() . "/local.php";
 
-// Path to access token managed by the external C pipeline
+if (!file_exists($local_config)) {
+    header('HTTP/1.1 500 Internal Server Error');
+    die("Fatal Error: 'local.php' not found in current directory (" . getcwd() . ")." . PHP_EOL);
+}
+
+include $local_config;
+
+// 2. Ensure Google Sheet ID and GID are defined in local.php
+$sheet_id  = $sheet_id  ?? $pun_sheet_id  ?? null;
+$sheet_gid = $sheet_gid ?? $pun_sheet_gid ?? null;
+
+if (empty($sheet_id) || empty($sheet_gid)) {
+    header('HTTP/1.1 500 Internal Server Error');
+    die("Fatal Error: '\$sheet_id' or '\$sheet_gid' not configured in local.php." . PHP_EOL);
+}
+
+// 3. Manage Google access token
 $token_file = "/home/www/data/google_access_token";
 
 if (!file_exists($token_file)) {
@@ -18,12 +34,42 @@ if (empty($access_token)) {
     exit(0);
 }
 
-// Convert input (String date OR numeric Unix Epoch) to YYYY-MM-DD
+// Helper to parse sqlgraph navigation parameters (?q=YYYYdDDD, ?q=YYYYwWW, ?q=YYYYmMM)
+function parse_q_param($q) {
+    $q = trim($q);
+    if (preg_match('/^(\d{4})d(\d{1,3})$/', $q, $m)) {
+        $year = intval($m[1]);
+        $day_of_year = intval($m[2]);
+        $dt = new DateTime();
+        $dt->setDate($year, 1, 1)->add(new DateInterval("P" . ($day_of_year - 1) . "D"));
+        $d = $dt->format('Y-m-d');
+        return array($d, $d);
+    }
+    if (preg_match('/^(\d{4})w(\d{1,2})$/', $q, $m)) {
+        $year = intval($m[1]);
+        $week = intval($m[2]);
+        $dt = new DateTime();
+        $dt->setISODate($year, $week, 1);
+        $start = $dt->format('Y-m-d');
+        $dt->modify('+6 days');
+        $end = $dt->format('Y-m-d');
+        return array($start, $end);
+    }
+    if (preg_match('/^(\d{4})m(\d{1,2})$/', $q, $m)) {
+        $year = intval($m[1]);
+        $month = intval($m[2]);
+        $start = sprintf("%04d-%02d-01", $year, $month);
+        $end = date("Y-m-t", strtotime($start));
+        return array($start, $end);
+    }
+    return false;
+}
+
+// Helper to parse input date strings into YYYY-MM-DD
 function parse_to_ymd($input) {
     $input = trim($input);
     if (empty($input)) return false;
 
-    // If sqlgraph passed a numeric Unix Timestamp (e.g. 1785362400)
     if (is_numeric($input) && strlen($input) >= 9) {
         return date("Y-m-d", intval($input));
     }
@@ -40,12 +86,24 @@ function parse_to_ymd($input) {
     return $epoch ? date("Y-m-d", $epoch) : false;
 }
 
-// Read parameters sent by sqlgraph or CLI
-$from_raw = $_GET['from'] ?? $_GET['start'] ?? $_GET['date_from'] ?? $_GET['date'] ?? ($argv[1] ?? null);
-$to_raw   = $_GET['to']   ?? $_GET['end']   ?? $_GET['date_to']   ?? ($argv[2] ?? null);
+// Determine target date range
+$start_date = null;
+$end_date   = null;
 
-$start_date = $from_raw ? parse_to_ymd($from_raw) : date("Y-m-d");
-$end_date   = $to_raw   ? parse_to_ymd($to_raw)   : $start_date;
+if (isset($_GET['q'])) {
+    $range = parse_q_param($_GET['q']);
+    if ($range) {
+        list($start_date, $end_date) = $range;
+    }
+}
+
+if (!$start_date) {
+    $from_raw   = $_GET['from'] ?? $_GET['start'] ?? $_GET['date_from'] ?? $_GET['date'] ?? ($argv[1] ?? null);
+    $to_raw     = $_GET['to']   ?? $_GET['end']   ?? $_GET['date_to']   ?? ($argv[2] ?? null);
+
+    $start_date = $from_raw ? parse_to_ymd($from_raw) : date("Y-m-d");
+    $end_date   = $to_raw   ? parse_to_ymd($to_raw)   : $start_date;
+}
 
 if ($start_date > $end_date) {
     $tmp = $start_date;
@@ -53,12 +111,8 @@ if ($start_date > $end_date) {
     $end_date = $tmp;
 }
 
-// Epoch bounds for exact sqlgraph filtering
-$min_epoch = (is_numeric($from_raw) && strlen($from_raw) >= 9) ? intval($from_raw) : strtotime("$start_date 00:00:00 UTC");
-$max_epoch = (is_numeric($to_raw)   && strlen($to_raw)   >= 9) ? intval($to_raw)   : strtotime("$end_date 23:59:59 UTC");
-
-// Fetch CSV export directly from Google Sheets
-$csv_url = "https://docs.google.com/spreadsheets/d/" . rawurlencode($pun_sheet_id) . "/export?format=csv&gid=" . rawurlencode($pun_sheet_gid);
+// Fetch CSV export from Google Sheets using parameters from local.php
+$csv_url = "https://docs.google.com/spreadsheets/d/" . rawurlencode($sheet_id) . "/export?format=csv&gid=" . rawurlencode($sheet_gid);
 
 $ch = curl_init($csv_url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -85,7 +139,7 @@ if (count($lines) < 2) {
     exit(0);
 }
 
-// Parse Header Row (Row 1) to build mapping: Column Index -> Local Time (HH:MM:SS)
+// Map CSV header columns to time strings
 $headers = str_getcsv($lines[0]);
 $col_time_map = array();
 
@@ -102,7 +156,7 @@ foreach ($headers as $idx => $header_val) {
 $tz_rome = new DateTimeZone('Europe/Rome');
 $output = array();
 
-// Iterate over data rows matching date range
+// Extract matching data points within date range
 for ($i = 1; $i < count($lines); $i++) {
     $line = trim($lines[$i]);
     if (empty($line)) continue;
@@ -134,15 +188,10 @@ for ($i = 1; $i < count($lines); $i++) {
                     $dt = new DateTime("$row_date $time_str", $tz_rome);
                 }
 
-                $point_epoch = $dt->getTimestamp();
-
-                // Exact filter based on sqlgraph window bounds
-                if ($point_epoch >= $min_epoch && $point_epoch <= $max_epoch) {
-                    $output[] = array(
-                        "epoch" => $point_epoch,
-                        "value" => $val
-                    );
-                }
+                $output[] = array(
+                    "epoch" => $dt->getTimestamp(),
+                    "value" => $val
+                );
             } catch (Exception $e) {
                 continue;
             }
@@ -150,12 +199,18 @@ for ($i = 1; $i < count($lines); $i++) {
     }
 }
 
-// Sort all points chronologically by epoch
+// Sort data chronologically by timestamp
 usort($output, function($a, $b) {
     return $a['epoch'] <=> $b['epoch'];
 });
 
-// Output clean JSON format
-header('Content-Type: application/json');
-echo json_encode($output) . PHP_EOL;
+// Populate global variables expected by sqlgraph engine
+$points = $output;
+$tab    = $output;
+
+// Output JSON when invoked directly via CLI or standalone HTTP request
+if (basename($_SERVER['SCRIPT_FILENAME'] ?? '') === basename(__FILE__)) {
+    header('Content-Type: application/json');
+    echo json_encode($output) . PHP_EOL;
+}
 ?>

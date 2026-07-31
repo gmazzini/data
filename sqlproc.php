@@ -1,13 +1,10 @@
 <?php
 // sqlproc.php
-// Data processing engine (Real-time SQL aggregation).
-//
-// Delta modes:
-//   delta = 0: average value within each aggregation bucket
-//   delta = 1: increment occurring within each aggregation bucket
-//   delta = 2: cumulative increment from the beginning of the requested period
+// Data processing engine (Real-time SQL aggregation with Italian Timezone).
 
-// Load local.php dynamically from current working directory
+// Imposta il fuso orario predefinito su Ora Italiana
+date_default_timezone_set('Europe/Rome');
+
 $local_config = getcwd() . '/local.php';
 
 if (file_exists($local_config)) {
@@ -17,17 +14,16 @@ if (file_exists($local_config)) {
     die("Error: Unable to find local.php in current working directory (" . getcwd() . ")\n");
 }
 
-// Default query period (Year and Day of Year)
+// Default query period
 if (!isset($q)) {
     $q = sprintf("%04dd%03d", (int)date("Y"), (int)date("z"));
 }
 
-// Parse date range according to period format
+// Parse date range according to period format (Italian Midnight to Midnight)
 if (substr($q, 4, 1) == "d") {
     $year      = (int)substr($q, 0, 4);
-    $dayOfYear = (int)substr($q, 5); // 0-indexed day of year (0..365)
+    $dayOfYear = (int)substr($q, 5);
 
-    // Using '!' resets time and month to Jan 1st 00:00:00 to prevent current-date bleed
     $aux = date_create_from_format("!Y", (string)$year);
     if ($aux) {
         date_add($aux, date_interval_create_from_date_string("$dayOfYear days"));
@@ -44,7 +40,6 @@ if (substr($q, 4, 1) == "d") {
     $year = (int)substr($q, 0, 4);
     $week = (int)substr($q, 5);
 
-    // Set explicitly to Monday (day 1) of ISO week
     $aux = date_create_from_format("!Y", (string)$year);
     date_isodate_set($aux, $year, $week, 1);
 
@@ -59,10 +54,9 @@ if (substr($q, 4, 1) == "d") {
     $year  = (int)substr($q, 0, 4);
     $month = max(1, min(12, (int)substr($q, 5)));
 
-    // Explicitly set day 01 to prevent 29/30/31 overflow
     $ds  = sprintf("%04d/%02d/01 00:00:00", $year, $month);
     $aux = date_create_from_format("Y/m/d H:i:s", $ds);
-    $de  = date_format($aux, "Y/m/t 23:59:59"); // 't' gets exact last day of month
+    $de  = date_format($aux, "Y/m/t 23:59:59");
 
     $q = sprintf("%04dm%02d", $year, $month);
 
@@ -83,7 +77,6 @@ $sde = strtotime($de);
 $dds = "from day:" . date("z", $sds) . ":" . date("w", $sds) . " week:" . date("W", $sds) . " month:" . date("m", $sds);
 $dde = "to day:" . date("z", $sde) . ":" . date("w", $sde) . " week:" . date("W", $sde) . " month:" . date("m", $sde);
 
-// Default axis ranges
 $axisRange = [
     0 => ['min' => 0, 'max' => 1],
     1 => ['min' => 0, 'max' => 1],
@@ -94,7 +87,6 @@ $axisStats = [
     1 => ['min' => null, 'max' => null],
 ];
 
-// Connect to database
 $conn = mysqli_connect($db_host, $db_user, $db_pass, $db_name);
 
 if (!$conn) {
@@ -104,7 +96,6 @@ if (!$conn) {
 
 @mysqli_set_charset($conn, "utf8mb4");
 
-// Build UNION query containing every epoch present in any configured table
 $unionParts = [];
 
 for ($i = 0; $i < count($tab); $i++) {
@@ -121,7 +112,6 @@ for ($i = 0; $i < count($tab); $i++) {
 
 $unionSql = implode("\n  UNION\n  ", $unionParts);
 
-// Build selected columns and joins
 $selectCols = ["e.epoch"];
 $joins = [];
 
@@ -141,7 +131,6 @@ for ($i = 0; $i < count($tab); $i++) {
 
     $joins[] = "LEFT JOIN `$tbl` $als ON $joinCond";
 
-    // Read delta as a real mode, not as a boolean
     $deltaMode = isset($tab[$i]["delta"]) ? (int)$tab[$i]["delta"] : 0;
     if ($deltaMode !== 0 && $deltaMode !== 1 && $deltaMode !== 2) {
         $deltaMode = 0;
@@ -162,13 +151,11 @@ for ($i = 0; $i < count($tab); $i++) {
 
         $seriesAxes[$key] = $axis;
 
-        // Simple column name
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $col)) {
             $selectCols[] = "$als.`$col` AS `$key`";
             continue;
         }
 
-        // SQL expression: qualify identifiers with the table alias
         $expr = preg_replace_callback(
             '/\b([A-Za-z_][A-Za-z0-9_]*)\b/',
             function ($m) use ($als) {
@@ -194,10 +181,7 @@ for ($i = 0; $i < count($tab); $i++) {
     }
 }
 
-// Count total epochs
 $sqlCount = "SELECT COUNT(*) AS N FROM ($unionSql) e";
-
-// Retrieve all data
 $sqlData = "SELECT " . implode(", ", $selectCols) . " FROM ($unionSql) e " . implode("\n", $joins) . " ORDER BY e.epoch";
 
 $resN = mysqli_query($conn, $sqlCount);
@@ -219,11 +203,9 @@ if ($N <= 0) {
     return;
 }
 
-// Number of raw rows aggregated into each output point
 $pointsVal = isset($points) ? max(1, (int)$points) : 96;
 $agg = max(1, (int)ceil($N / $pointsVal));
 
-// In-memory temporal buffer
 $fp = fopen("php://temp", "w+");
 
 if (!$fp) {
@@ -232,7 +214,6 @@ if (!$fp) {
     return;
 }
 
-// Per-series state
 $last = [];
 $acc = [];
 $cnt = [];
@@ -247,7 +228,6 @@ foreach ($seriesKeys as $key) {
     $baseRaw[$key] = null;
 }
 
-// Pre-fetch baseline/previous value before the requested period
 for ($i = 0; $i < count($tab); $i++) {
     $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $tab[$i]["table"]);
     $whereInit = "epoch < $sds";
@@ -296,7 +276,6 @@ for ($i = 0; $i < count($tab); $i++) {
     }
 }
 
-// Execute main query
 $res = mysqli_query($conn, $sqlData);
 
 if (!$res) {
@@ -309,7 +288,6 @@ if (!$res) {
 $nagg = 0;
 $lastEpochInBucket = null;
 
-// Process rows
 while ($row = mysqli_fetch_assoc($res)) {
     $epoch = (int)$row["epoch"];
     $lastEpochInBucket = $epoch;
@@ -349,16 +327,16 @@ while ($row = mysqli_fetch_assoc($res)) {
 
     $nagg++;
 
-    // Emit completed bucket
     if ($nagg >= $agg) {
         $dd = $lastEpochInBucket;
         $out = [];
 
+        // Data e ora formattati in ORA ITALIANA (GG/MM/AA HH:MM)
         $out[] = sprintf(
-            "'%s%s%s %s%s'",
-            date("y", $dd),
-            date("m", $dd),
+            "'%s/%s/%s %s:%s'",
             date("d", $dd),
+            date("m", $dd),
+            date("y", $dd),
             date("H", $dd),
             date("i", $dd)
         );
@@ -400,7 +378,6 @@ while ($row = mysqli_fetch_assoc($res)) {
                 $out[] = sprintf("%9.5f", $m);
             }
 
-            // Reset bucket state
             $acc[$key] = 0.0;
             $cnt[$key] = 0;
         }
@@ -410,16 +387,16 @@ while ($row = mysqli_fetch_assoc($res)) {
     }
 }
 
-// Emit final incomplete bucket
 if ($nagg > 0 && $lastEpochInBucket !== null) {
     $dd = $lastEpochInBucket;
     $out = [];
 
+    // Data e ora formattati in ORA ITALIANA (GG/MM/AA HH:MM)
     $out[] = sprintf(
-        "'%s%s%s %s%s'",
-        date("y", $dd),
-        date("m", $dd),
+        "'%s/%s/%s %s:%s'",
         date("d", $dd),
+        date("m", $dd),
+        date("y", $dd),
         date("H", $dd),
         date("i", $dd)
     );
@@ -468,7 +445,6 @@ if ($nagg > 0 && $lastEpochInBucket !== null) {
 mysqli_free_result($res);
 mysqli_close($conn);
 
-// Compute axis bounds
 for ($axis = 0; $axis <= 1; $axis++) {
     if (
         isset($axisStats[$axis]) &&
@@ -489,7 +465,6 @@ for ($axis = 0; $axis <= 1; $axis++) {
     }
 }
 
-// Deliver response directly from memory
 rewind($fp);
 echo stream_get_contents($fp);
 fclose($fp);

@@ -110,6 +110,12 @@ if ($current_mode === 'w') {
     $date_label = $dt->format('d/m/Y');
 }
 
+// Calculate Italian timezone offset (+1h standard time / +2h daylight saving time)
+$tz_rome = new DateTimeZone('Europe/Rome');
+$offset_sec = $tz_rome->getOffset($dt);
+$offset_hours = (int)($offset_sec / 3600);
+$h_axis_title = sprintf("Date (UTC) — Ora Italiana: +%dh", $offset_hours);
+
 // Execute data processing module
 $labels = $labels ?? [];
 $seriesOpt = $seriesOpt ?? [];
@@ -207,7 +213,12 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
   <meta charset="utf-8" />
   <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
   <style>
-    body { margin: 4px; font-family: Arial, sans-serif; }
+    html, body {
+      margin: 0;
+      padding: 2px 4px;
+      font-family: Arial, sans-serif;
+      overflow-x: hidden;
+    }
     .nav-toolbar {
       display: flex;
       align-items: center;
@@ -216,7 +227,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
       padding: 3px 8px;
       border-radius: 4px;
       border: 1px solid #ced4da;
-      margin-bottom: 0px;
+      margin-bottom: 2px;
       font-size: 13px;
     }
     .nav-btn {
@@ -277,8 +288,17 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
         curveType: 'none',
         legend: { position: 'top' },
 
+        chartArea: {
+          top: 35,
+          left: '6%',
+          right: '4%',
+          bottom: 85,
+          width: '90%',
+          height: '75%'
+        },
+
         hAxis: {
-          title: "Date (UTC) — Ora Italiana: +1h / +2h (ora legale)",
+          title: <?= json_encode($h_axis_title, JSON_UNESCAPED_UNICODE) ?>,
           slantedText: true,
           slantedTextAngle: 90
         },
@@ -314,7 +334,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     <span class="nav-date-label"><?= htmlspecialchars($date_label, ENT_QUOTES, 'UTF-8') ?></span>
   </div>
 
-  <div id="curve_chart" style="width:100%; height:700px"></div>
+  <div id="curve_chart" style="width:100%; height:calc(100vh - 42px); min-height:500px;"></div>
 
 </body>
 </html>

@@ -1,5 +1,5 @@
 <?php
-// sqlgraph.php - Chart rendering script with compact navigation toolbar[cite: 4]
+// sqlgraph.php - Chart rendering script with compact navigation toolbar
 
 // Load local.php dynamically from current working directory
 $local_config = getcwd() . '/local.php';
@@ -96,10 +96,10 @@ $q_mode_d = build_q_param($dt, 'd');
 $q_mode_w = build_q_param($dt, 'w');
 $q_mode_m = build_q_param($dt, 'm');
 
-// Calculate purge cache parameter
-$q_purge = "?q=" . $q . "&purge=1";
+// Simple Reload link
+$q_reload = "?q=" . $q;
 
-// Format date display label in English
+// Format date display label
 if ($current_mode === 'w') {
     $end_w = clone $dt;
     $end_w->modify('+6 days');
@@ -139,69 +139,63 @@ $rowsText = rtrim($rowsText, ", \r\n\t");
 $rows = [];
 
 if ($rowsText !== "") {
-  $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
-  $rows = json_decode($jsonish, true);
+    $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
+    $rows = json_decode($jsonish, true);
 
-  if (!is_array($rows)) {
-    $rows = [];
-  }
+    if (!is_array($rows)) {
+        $rows = [];
+    }
 }
 
 $dataRowsJs = [];
 
 foreach ($rows as $r) {
-  $out = [];
+    $out = [];
+    $out[] = json_encode($r[0] ?? "", JSON_UNESCAPED_UNICODE);
 
-  $out[] = json_encode($r[0] ?? "", JSON_UNESCAPED_UNICODE);
-
-  for ($j = 1; $j < count($header); $j++) {
-    if (!array_key_exists($j, $r) || $r[$j] === null) {
-      $out[] = "null";
-    } else {
-      $out[] = sprintf("%.5f", (float)$r[$j]);
+    for ($j = 1; $j < count($header); $j++) {
+        if (!array_key_exists($j, $r) || $r[$j] === null) {
+            $out[] = "null";
+        } else {
+            $out[] = sprintf("%.5f", (float)$r[$j]);
+        }
     }
-  }
 
-  $dataRowsJs[] = "[" . implode(", ", $out) . "]";
+    $dataRowsJs[] = "[" . implode(", ", $out) . "]";
 }
 
 $dataRowsFinal = implode(",\n        ", $dataRowsJs);
 
 $axisRange = $axisRange ?? [
-  0 => ['min' => 0, 'max' => 1],
-  1 => ['min' => 0, 'max' => 1],
+    0 => ['min' => 0, 'max' => 1],
+    1 => ['min' => 0, 'max' => 1],
 ];
 
-$vAxes = [
-  0 => ['title' => $axisTitleLeft],
-  1 => ['title' => $axisTitleRight],
-];
+$vAxes = [];
 
 for ($axis = 0; $axis <= 1; $axis++) {
-  if (
-    isset($axisRange[$axis]) &&
-    isset($axisRange[$axis]['min']) &&
-    isset($axisRange[$axis]['max'])
-  ) {
-    $min = (float)$axisRange[$axis]['min'];
-    $max = (float)$axisRange[$axis]['max'];
-
-    if ($min == $max) {
-      $min = $min - 1;
-      $max = $max + 1;
-    }
-
-    $vAxes[$axis]['viewWindow'] = [
-      'min' => $min,
-      'max' => $max
+    $vAxes[$axis] = [
+        'title' => ($axis === 0) ? $axisTitleLeft : $axisTitleRight
     ];
 
-    if ($axis === 0) {
-      $vAxes[$axis]['title'] = $axisTitleLeft . " (" . $min . " - " . $max . ")";
-    } else {
-      $vAxes[$axis]['title'] = $axisTitleRight . " (" . $min . " - " . $max . ")";
+    if (
+        isset($axisRange[$axis]) &&
+        isset($axisRange[$axis]['min']) &&
+        isset($axisRange[$axis]['max'])
+    ) {
+        $min = (float)$axisRange[$axis]['min'];
+        $max = (float)$axisRange[$axis]['max'];
+
+        if ($min == $max) {
+            $min -= 1;
+            $max += 1;
+        }
+
+        $vAxes[$axis]['viewWindow'] = [
+            'min' => $min,
+            'max' => $max
+        ];
     }
-  }
 }
 
 $vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);
@@ -284,7 +278,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
         legend: { position: 'top' },
 
         hAxis: {
-          title: "Date / Time",
+          title: "Date (UTC) — Ora Italiana: +1h / +2h (ora legale)",
           slantedText: true,
           slantedTextAngle: 90
         },
@@ -316,7 +310,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     <a href="?q=<?= $q_mode_w ?>" class="nav-btn <?= $current_mode === 'w' ? 'active' : '' ?>">WEEK</a>
     <a href="?q=<?= $q_mode_m ?>" class="nav-btn <?= $current_mode === 'm' ? 'active' : '' ?>">MONTH</a>
     &nbsp;|
-    <a href="<?= $q_purge ?>" class="nav-btn" title="Purge cache & reload view">&#128259;</a>
+    <a href="<?= $q_reload ?>" class="nav-btn" title="Reload view">&#128259;</a>
     <span class="nav-date-label"><?= htmlspecialchars($date_label, ENT_QUOTES, 'UTF-8') ?></span>
   </div>
 

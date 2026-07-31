@@ -17,79 +17,64 @@ if (file_exists($local_config)) {
     die("Error: Unable to find local.php in current working directory (" . getcwd() . ")\n");
 }
 
-// Default query period
+// Default query period (Year and Day of Year)
 if (!isset($q)) {
-    $q = date("Y\\dz");
+    $q = sprintf("%04dd%03d", (int)date("Y"), (int)date("z"));
 }
 
 // Parse date range according to period format
 if (substr($q, 4, 1) == "d") {
-    $aux = date_create_from_format(
-        "Yz",
-        substr($q, 0, 4) . substr($q, 5)
-    );
+    $year      = (int)substr($q, 0, 4);
+    $dayOfYear = (int)substr($q, 5); // 0-indexed day of year (0..365)
 
-    $ds = date_format($aux, "Y/m/d 00:00:00");
-    $de = date_format($aux, "Y/m/d 23:59:59");
+    // Using '!' resets time and month to Jan 1st 00:00:00 to prevent current-date bleed
+    $aux = date_create_from_format("!Y", (string)$year);
+    if ($aux) {
+        date_add($aux, date_interval_create_from_date_string("$dayOfYear days"));
+        $ds = date_format($aux, "Y/m/d 00:00:00");
+        $de = date_format($aux, "Y/m/d 23:59:59");
+    } else {
+        $ds = date("Y/m/d 00:00:00");
+        $de = date("Y/m/d 23:59:59");
+    }
 
-    $q = sprintf(
-        "%04dd%03d",
-        substr($q, 0, 4),
-        substr($q, 5)
-    );
+    $q = sprintf("%04dd%03d", $year, $dayOfYear);
 
 } elseif (substr($q, 4, 1) == "w") {
-    $aux = date_create();
+    $year = (int)substr($q, 0, 4);
+    $week = (int)substr($q, 5);
 
-    date_isodate_set(
-        $aux,
-        substr($q, 0, 4),
-        substr($q, 5)
-    );
+    // Set explicitly to Monday (day 1) of ISO week
+    $aux = date_create_from_format("!Y", (string)$year);
+    date_isodate_set($aux, $year, $week, 1);
 
     $ds = date_format($aux, "Y/m/d 00:00:00");
 
-    date_add(
-        $aux,
-        date_interval_create_from_date_string("6 days")
-    );
-
+    date_add($aux, date_interval_create_from_date_string("6 days"));
     $de = date_format($aux, "Y/m/d 23:59:59");
 
-    $q = sprintf(
-        "%04dw%02d",
-        substr($q, 0, 4),
-        substr($q, 5)
-    );
+    $q = sprintf("%04dw%02d", $year, $week);
 
 } elseif (substr($q, 4, 1) == "m") {
-    $aux = date_create_from_format(
-        "Yn",
-        substr($q, 0, 4) . substr($q, 5)
-    );
+    $year  = (int)substr($q, 0, 4);
+    $month = max(1, min(12, (int)substr($q, 5)));
 
-    $ds = date_format($aux, "Y/m/01 00:00:00");
-    $de = date_format($aux, "Y/m/t 23:59:59");
+    // Explicitly set day 01 to prevent 29/30/31 overflow
+    $ds  = sprintf("%04d/%02d/01 00:00:00", $year, $month);
+    $aux = date_create_from_format("Y/m/d H:i:s", $ds);
+    $de  = date_format($aux, "Y/m/t 23:59:59"); // 't' gets exact last day of month
 
-    $q = sprintf(
-        "%04dm%02d",
-        substr($q, 0, 4),
-        substr($q, 5)
-    );
+    $q = sprintf("%04dm%02d", $year, $month);
 
 } else {
-    $aux = date_create();
+    $now       = date_create();
+    $year      = (int)date_format($now, "Y");
+    $dayOfYear = (int)date_format($now, "z");
 
-    $ds = date_format($aux, "Y/m/d 00:00:00");
-    $de = date_format($aux, "Y/m/d 23:59:59");
+    $ds = date_format($now, "Y/m/d 00:00:00");
+    $de = date_format($now, "Y/m/d 23:59:59");
 
-    $q = date("Y\\dz");
-
-    $q = sprintf(
-        "%04dd%03d",
-        substr($q, 0, 4),
-        substr($q, 5)
-    );
+    $q = sprintf("%04dd%03d", $year, $dayOfYear);
 }
 
 $sds = strtotime($ds);
@@ -235,7 +220,8 @@ if ($N <= 0) {
 }
 
 // Number of raw rows aggregated into each output point
-$agg = max(1, (int)ceil($N / $points));
+$pointsVal = isset($points) ? max(1, (int)$points) : 96;
+$agg = max(1, (int)ceil($N / $pointsVal));
 
 // In-memory temporal buffer
 $fp = fopen("php://temp", "w+");
@@ -478,6 +464,35 @@ if ($nagg > 0 && $lastEpochInBucket !== null) {
 
     fprintf($fp, "[%s],\n", implode(", ", $out));
 }
+
+mysqli_free_result($res);
+mysqli_close($conn);
+
+// Compute axis bounds
+for ($axis = 0; $axis <= 1; $axis++) {
+    if (
+        isset($axisStats[$axis]) &&
+        $axisStats[$axis]['min'] !== null &&
+        $axisStats[$axis]['max'] !== null
+    ) {
+        $min = (float)$axisStats[$axis]['min'];
+        $max = (float)$axisStats[$axis]['max'];
+
+        if ($min == $max) {
+            $min--;
+            $max++;
+        }
+
+        $axisRange[$axis] = ['min' => $min, 'max' => $max];
+    } else {
+        $axisRange[$axis] = ['min' => 0, 'max' => 1];
+    }
+}
+
+// Deliver response directly from memory
+rewind($fp);
+echo stream_get_contents($fp);
+fclose($fp);
 
 mysqli_free_result($res);
 mysqli_close($conn);

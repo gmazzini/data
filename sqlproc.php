@@ -493,32 +493,3 @@ for ($axis = 0; $axis <= 1; $axis++) {
 rewind($fp);
 echo stream_get_contents($fp);
 fclose($fp);
-
-mysqli_free_result($res);
-mysqli_close($conn);
-
-// Compute axis bounds
-for ($axis = 0; $axis <= 1; $axis++) {
-    if (
-        isset($axisStats[$axis]) &&
-        $axisStats[$axis]['min'] !== null &&
-        $axisStats[$axis]['max'] !== null
-    ) {
-        $min = (float)$axisStats[$axis]['min'];
-        $max = (float)$axisStats[$axis]['max'];
-
-        if ($min == $max) {
-            $min--;
-            $max++;
-        }
-
-        $axisRange[$axis] = ['min' => $min, 'max' => $max];
-    } else {
-        $axisRange[$axis] = ['min' => 0, 'max' => 1];
-    }
-}
-
-// Deliver response directly from memory
-rewind($fp);
-echo stream_get_contents($fp);
-fclose($fp);

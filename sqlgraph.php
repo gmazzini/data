@@ -1,5 +1,5 @@
 <?php
-// sqlgraph.php - Chart rendering script with compact navigation toolbar
+// sqlgraph.php - Responsive chart rendering script
 
 // Imposta il fuso orario predefinito su Ora Italiana
 date_default_timezone_set('Europe/Rome');
@@ -27,7 +27,7 @@ function build_q_param(DateTime $dt, string $mode): string {
 
 $tz_rome = new DateTimeZone('Europe/Rome');
 
-// Parse active period or fallback to today (Italian Time)
+// Parse active period or fallback to today
 $current_mode = 'd';
 $dt = new DateTime('now', $tz_rome);
 $dt->setTime(0, 0, 0);
@@ -48,7 +48,7 @@ if (preg_match('/^(\d{4})([dwm])(\d+)$/', $q_raw, $m)) {
     }
 }
 
-// Determine maximum allowed limit (today/current period)
+// Determine maximum allowed limit
 $dt_now = new DateTime('now', $tz_rome);
 $dt_now->setTime(0, 0, 0);
 
@@ -62,7 +62,6 @@ if ($current_mode === 'w') {
     $dt_max = clone $dt_now;
 }
 
-// Cap navigation so user cannot request future dates
 if ($dt > $dt_max) {
     $dt = clone $dt_max;
 }
@@ -82,26 +81,19 @@ if ($current_mode === 'w') {
     $dt_next->modify('+1 day');
 }
 
-// Check if next period exceeds current date limit
 $is_future = ($dt_next > $dt_max);
 
 $q_prev = build_q_param($dt_prev, $current_mode);
 $q_next = build_q_param($dt_next, $current_mode);
-
-// Set $q variable required by sqlproc.php
 $q = build_q_param($dt, $current_mode);
-
-// Calculate ACT (Current time)
 $q_act = build_q_param($dt_max, $current_mode);
 
-// Calculate mode switch buttons
 $q_mode_d = build_q_param($dt, 'd');
 $q_mode_w = build_q_param($dt, 'w');
 $q_mode_m = build_q_param($dt, 'm');
 
 $q_reload = "?q=" . $q;
 
-// Format date display label
 if ($current_mode === 'w') {
     $end_w = clone $dt;
     $end_w->modify('+6 days');
@@ -112,7 +104,6 @@ if ($current_mode === 'w') {
     $date_label = $dt->format('d/m/Y');
 }
 
-// Titolo asse orizzontale pulito
 $h_axis_title = "Data / Ora (Ora Italiana)";
 
 // Execute data processing module
@@ -207,9 +198,11 @@ $vAxesJs = json_encode((object)$vAxes, JSON_UNESCAPED_UNICODE);
 $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 ?>
 <!doctype html>
-<html lang="en">
+<html lang="it">
 <head>
   <meta charset="utf-8" />
+  <!-- CRUCIALE PER MOBILE: imposta la larghezza della viewport al dispositivo reale -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
   <style>
     html, body {
@@ -220,10 +213,11 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-toolbar {
       display: flex;
+      flex-wrap: wrap; /* Permette il wrap pulito su schermi molto stretti */
       align-items: center;
       gap: 4px;
       background: #f1f3f5;
-      padding: 3px 8px;
+      padding: 4px 6px;
       border-radius: 4px;
       border: 1px solid #ced4da;
       margin-bottom: 2px;
@@ -231,7 +225,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-btn {
       display: inline-block;
-      padding: 2px 8px;
+      padding: 4px 8px; /* Area touch leggermente più grande per le dita */
       background: #ffffff;
       color: #333333;
       text-decoration: none;
@@ -259,7 +253,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-btn-act:hover { background: #157347; }
     .nav-date-label {
-      margin-left: 8px;
+      margin-left: 4px;
       font-weight: bold;
       color: #212529;
     }
@@ -268,6 +262,9 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
   <script>
     google.charts.load('current', {packages:['corechart']});
     google.charts.setOnLoadCallback(drawChart);
+
+    // Ridisegna automaticamente il grafico ad ogni cambio di orientamento o resize della finestra
+    window.addEventListener('resize', drawChart);
 
     function drawChart() {
       const data = new google.visualization.DataTable();
@@ -282,31 +279,36 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
         <?= $dataRowsFinal !== "" ? "\n        " . $dataRowsFinal . "\n      " : "" ?>
       ]);
 
+      // Rileva se lo schermo è in formato mobile (< 600px)
+      const isMobile = window.innerWidth < 600;
+
       const options = {
         title: <?= json_encode($title, JSON_UNESCAPED_UNICODE) ?>,
         curveType: 'none',
-        legend: { position: 'top' },
+        legend: {
+          position: 'top',
+          textStyle: { fontSize: isMobile ? 10 : 12 }
+        },
 
+        // Layout adattivo per prevenire il taglio delle etichette
         chartArea: {
-          top: 30,
-          left: '5%',
-          right: '3%',
-          bottom: 110,
-          width: '92%',
-          height: '70%'
+          top: isMobile ? 35 : 30,
+          left: isMobile ? 45 : '5%',     // Margine in pixel fissi su mobile per garantire spazio alle cifre Y
+          right: isMobile ? 15 : '3%',
+          bottom: isMobile ? 90 : 110,   // Spazio sufficiente per le etichette inclined a 60 gradi
+          width: isMobile ? '85%' : '92%',
+          height: isMobile ? '65%' : '70%'
         },
 
         hAxis: {
           title: <?= json_encode($h_axis_title, JSON_UNESCAPED_UNICODE) ?>,
           slantedText: true,
           slantedTextAngle: 60,
-          textStyle: { fontSize: 11 }
+          textStyle: { fontSize: isMobile ? 9 : 11 }
         },
 
         vAxes: <?= $vAxesJs ?>,
-
         series: <?= $seriesOptJs ?>
-
       };
 
       new google.visualization.LineChart(document.getElementById('curve_chart'))
@@ -334,7 +336,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     <span class="nav-date-label"><?= htmlspecialchars($date_label, ENT_QUOTES, 'UTF-8') ?></span>
   </div>
 
-  <div id="curve_chart" style="width:100%; height:calc(100vh - 42px); min-height:500px;"></div>
+  <div id="curve_chart" style="width:100%; height:calc(100vh - 48px); min-height:400px;"></div>
 
 </body>
 </html>

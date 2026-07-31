@@ -45,15 +45,9 @@ if (!$conn) {
 }
 @mysqli_set_charset($conn, "utf8mb4");
 
-// Query dataset for the given month interval
-$sql = "SELECT epoch, pun FROM `$table_name` WHERE epoch BETWEEN $sds AND $sde ORDER BY epoch ASC";
+// Query dataset using column 'c' (cost/price)
+$sql = "SELECT epoch, c FROM `$table_name` WHERE epoch BETWEEN $sds AND $sde ORDER BY epoch ASC";
 $res = mysqli_query($conn, $sql);
-
-// Fallback if column name is 'prezzo' instead of 'pun'
-if (!$res) {
-    $sql = "SELECT epoch, prezzo AS pun FROM `$table_name` WHERE epoch BETWEEN $sds AND $sde ORDER BY epoch ASC";
-    $res = mysqli_query($conn, $sql);
-}
 
 if (!$res || mysqli_num_rows($res) === 0) {
     mysqli_close($conn);
@@ -64,10 +58,10 @@ if (!$res || mysqli_num_rows($res) === 0) {
 $sums   = ['F0' => 0.0, 'F1' => 0.0, 'F2' => 0.0, 'F3' => 0.0];
 $counts = ['F0' => 0,   'F1' => 0,   'F2' => 0,   'F3' => 0];
 
-// Iterate through records
+// Iterate through database records
 while ($row = mysqli_fetch_assoc($res)) {
     $epoch = (int)$row['epoch'];
-    $val   = (float)$row['pun'];
+    $val   = (float)$row['c'];
 
     // Convert GMT epoch to Italian timezone DateTime
     $dt = new DateTime("@$epoch");

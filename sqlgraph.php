@@ -1,6 +1,9 @@
 <?php
 // sqlgraph.php - Chart rendering script with compact navigation toolbar
 
+// Imposta il fuso orario predefinito su Ora Italiana
+date_default_timezone_set('Europe/Rome');
+
 $local_config = getcwd() . '/local.php';
 if (file_exists($local_config)) {
     require_once $local_config;
@@ -22,10 +25,9 @@ function build_q_param(DateTime $dt, string $mode): string {
     return sprintf("%04dd%03d", $y, $dt->format('z'));
 }
 
-// Explicitly bind timezone to Rome for exact Italian time offset evaluation
 $tz_rome = new DateTimeZone('Europe/Rome');
 
-// Parse active period or fallback to today
+// Parse active period or fallback to today (Italian Time)
 $current_mode = 'd';
 $dt = new DateTime('now', $tz_rome);
 $dt->setTime(0, 0, 0);
@@ -110,10 +112,8 @@ if ($current_mode === 'w') {
     $date_label = $dt->format('d/m/Y');
 }
 
-// Calculate exact offset for the requested period (shows +2h in Summer, +1h in Winter)
-$offset_sec = $tz_rome->getOffset($dt);
-$offset_hours = (int)($offset_sec / 3600);
-$h_axis_title = sprintf("Date (UTC) — Ora Italiana: +%dh", $offset_hours);
+// Titolo asse orizzontale pulito
+$h_axis_title = "Data / Ora (Ora Italiana)";
 
 // Execute data processing module
 $labels = $labels ?? [];

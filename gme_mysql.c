@@ -341,14 +341,20 @@ int main(int argc,char *argv[]) {
     if(s==NULL) break;
 
     s=strchr(s,':');
+    if(s==NULL) break;
     s=s+1;
-    while(*s==' ') s=s+1;
+
+    // Skip spaces and quotation marks before the numeric value
+    while(*s==' '||*s=='"') s=s+1;
+
     e=s;
-    while(*e!=','&&*e!='}'&&*e!=0) e=e+1;
+    // Find the end of the number (quote, comma, brace, bracket or whitespace)
+    while(*e!='"'&&*e!=','&&*e!='}'&&*e!=']'&&*e!='\r'&&*e!='\n'&&*e!=0) e=e+1;
 
     j=0;
     while(s<e&&j<(int)sizeof(one_price)-1) {
-      one_price[j]=*s;
+      if(*s==',') one_price[j]='.';
+      else one_price[j]=*s;
       j++;
       s=s+1;
     }
@@ -405,14 +411,14 @@ int main(int argc,char *argv[]) {
     return 1;
   }
 
-  // Insert records into table pun_15m using sequential epoch timestamps
+  // Insert or overwrite records into table pun_15m
   for(i=0;i<count;i++) {
     current_epoch=E0+(i*900);
     price_val=atof(price_values[i]);
 
     snprintf(query,sizeof(query),
-      "insert into pun_15m (epoch,c) values(%ld,%.5f) on duplicate key update c=values(c)",
-      (long)current_epoch,price_val);
+      "insert into pun_15m (epoch,c) values(%ld,%.5f) on duplicate key update c=%.5f",
+      (long)current_epoch,price_val,price_val);
 
     if(mysql_query(con,query)!=0) {
       fprintf(stderr,"mysql query error: %s\n",mysql_error(con));

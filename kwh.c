@@ -17,6 +17,7 @@ struct mem {
 typedef struct {
   char id[128];
   char name[256];
+  char mime_type[128];
 } DriveFile;
 
 static void mem_init(struct mem *m) {
@@ -60,7 +61,7 @@ static int read_access_token(char *buf, size_t buflen) {
   return 1;
 }
 
-// Minimal JSON parser for Drive files.list response
+// Parse JSON response from Google Drive files.list
 static int parse_drive_files(const char *json, DriveFile *out_files, int max_files) {
   int count = 0;
   const char *files_sec = strstr(json, "\"files\"");
@@ -89,19 +90,35 @@ static int parse_drive_files(const char *json, DriveFile *out_files, int max_fil
     const char *q4 = strchr(q3, '"');
     if (!q4) break;
 
+    const char *mime_key = strstr(q4, "\"mimeType\"");
+    if (!mime_key) break;
+    const char *colon3 = strchr(mime_key, ':');
+    if (!colon3) break;
+    const char *q5 = strchr(colon3, '"');
+    if (!q5) break;
+    q5++;
+    const char *q6 = strchr(q5, '"');
+    if (!q6) break;
+
     size_t id_len = q2 - q1;
     size_t name_len = q4 - q3;
+    size_t mime_len = q6 - q5;
 
-    if (id_len < sizeof(out_files[count].id) && name_len < sizeof(out_files[count].name)) {
+    if (id_len < sizeof(out_files[count].id) && 
+        name_len < sizeof(out_files[count].name) &&
+        mime_len < sizeof(out_files[count].mime_type)) {
       memcpy(out_files[count].id, q1, id_len);
       out_files[count].id[id_len] = '\0';
 
       memcpy(out_files[count].name, q3, name_len);
       out_files[count].name[name_len] = '\0';
 
+      memcpy(out_files[count].mime_type, q5, mime_len);
+      out_files[count].mime_type[mime_len] = '\0';
+
       count++;
     }
-    p = q4 + 1;
+    p = q6 + 1;
   }
   return count;
 }
@@ -251,19 +268,13 @@ static int process_and_insert_csv(MYSQL *conn, const char *table_name, const cha
           time_t epoch = mktime(&tm_info);
           if (epoch == -1) continue;
 
-          struct tm *utc_tm = gmtime(&epoch);
-          char gmt_str[32];
-          strftime(gmt_str, sizeof(gmt_str), "%Y-%m-%d %H:%M:%S", utc_tm);
-
-          char local_str[32];
-          strftime(local_str, sizeof(local_str), "%Y-%m-%d %H:%M:%S", &tm_info);
-
+          // Insert record using epoch and kwh columns
           char query[1024];
           snprintf(query, sizeof(query),
-            "INSERT INTO `%s` (timestamp_epoch, timestamp_gmt, timestamp_local, kwh) "
-            "VALUES (%ld, '%s', '%s', %.4f) "
+            "INSERT INTO `%s` (epoch, kwh) "
+            "VALUES (%ld, %.4f) "
             "ON DUPLICATE KEY UPDATE kwh=VALUES(kwh);",
-            table_name, (long)epoch, gmt_str, local_str, val);
+            table_name, (long)epoch, val);
 
           if (mysql_query(conn, query)) {
             fprintf(stderr, "MySQL query error on table %s: %s\n", table_name, mysql_error(conn));
@@ -327,12 +338,12 @@ int main(int argc, char *argv[]) {
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, auth_header);
 
-  // Retrieve file list from Google Drive folder
+  // Retrieve file list with mimeType from Google Drive folder
   char url[4096];
   snprintf(url, sizeof(url),
            "https://www.googleapis.com/drive/v3/files"
            "?q='%s'+in+parents+and+trashed=false"
-           "&fields=files(id,name)"
+           "&fields=files(id,name,mimeType)"
            "&pageSize=100"
            "&supportsAllDrives=true"
            "&includeItemsFromAllDrives=true",
@@ -360,11 +371,19 @@ int main(int argc, char *argv[]) {
 
   // Download, insert into MySQL and delete each file from Drive
   for (int i = 0; i < file_count; i++) {
-    printf("[%d/%d] Downloading '%s' (ID: %s)...\n", i + 1, file_count, files[i].name, files[i].id);
+    printf("[%d/%d] Downloading '%s' (ID: %s, MIME: %s)...\n", 
+           i + 1, file_count, files[i].name, files[i].id, files[i].mime_type);
 
-    snprintf(url, sizeof(url),
-             "https://www.googleapis.com/drive/v3/files/%s?alt=media&supportsAllDrives=true",
-             files[i].id);
+    // Handle Google Sheets export vs standard file download
+    if (strcmp(files[i].mime_type, "application/vnd.google-apps.spreadsheet") == 0) {
+      snprintf(url, sizeof(url),
+               "https://www.googleapis.com/drive/v3/files/%s/export?mimeType=text/csv&supportsAllDrives=true",
+               files[i].id);
+    } else {
+      snprintf(url, sizeof(url),
+               "https://www.googleapis.com/drive/v3/files/%s?alt=media&supportsAllDrives=true",
+               files[i].id);
+    }
 
     struct mem file_body;
     mem_init(&file_body);

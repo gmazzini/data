@@ -13,7 +13,6 @@
 // Target configuration definitions
 #define TOKEN_FILE "/home/www/data/google_access_token"
 #define SPREADSHEET_ID "1fw-Nq7RPMs9JF4bb62LGrXuqg81v1bPJjupOmGsCCqg"
-#define BASE_YEAR 2021
 
 // Buffer structure for HTTP response body
 typedef struct {
@@ -180,8 +179,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (target_year < BASE_YEAR || target_year > 2099) {
-        fprintf(stderr, "Error: Invalid target year %d. Must be >= %d.\n", target_year, BASE_YEAR);
+    // Impostazione dell'anno di partenza dinamico
+    int base_year = (strcmp(measure_type, "kwh_so") == 0) ? 2021 : 2024;
+
+    if (target_year < base_year || target_year > 2099) {
+        fprintf(stderr, "Error: Invalid target year %d for %s. Must be >= %d.\n", target_year, measure_type, base_year);
         return 1;
     }
 
@@ -298,8 +300,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 1. UPDATE HOURLY TAB (es. C2:C26 per il 2022)
-    int hourly_col_idx = 2 + (target_year - BASE_YEAR);
+    // 1. UPDATE HOURLY TAB
+    // SO: Colonna B (idx 2) = 2021 | CC: Colonna B (idx 2) = 2024
+    int hourly_col_idx = 2 + (target_year - base_year);
     char hourly_col_letter[16];
     get_column_letter(hourly_col_idx, hourly_col_letter);
 
@@ -320,8 +323,9 @@ int main(int argc, char *argv[]) {
         free(json_h);
     }
 
-    // 2. UPDATE MONTHLY TAB (es. F2:I14 per il 2022)
-    int start_m_col = 2 + (target_year - BASE_YEAR) * 4;
+    // 2. UPDATE MONTHLY TAB
+    // SO: B..E (2021), F..I (2022) | CC: B..E (2024), F..I (2025)
+    int start_m_col = 2 + (target_year - base_year) * 4;
     int end_m_col = start_m_col + 3;
 
     char start_m_letter[16], end_m_letter[16];

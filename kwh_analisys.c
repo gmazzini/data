@@ -236,20 +236,16 @@ int main(int argc, char *argv[]) {
     time_t start_epoch = mktime(&start_tm);
     time_t end_epoch = mktime(&end_tm);
 
+    // Query per la tabella selezionata (kwh_so oppure kwh_cc)
     char query[1024];
     snprintf(query, sizeof(query),
-             "SELECT epoch, %s FROM energy_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
+             "SELECT epoch, kwh FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
              measure_type, (long)start_epoch, (long)end_epoch);
 
     if (mysql_query(conn, query)) {
-        snprintf(query, sizeof(query),
-                 "SELECT epoch, %s FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-                 measure_type, (long)start_epoch, (long)end_epoch);
-        if (mysql_query(conn, query)) {
-            fprintf(stderr, "mysql query error: %s\n", mysql_error(conn));
-            mysql_close(conn);
-            return 1;
-        }
+        fprintf(stderr, "mysql query error: %s\n", mysql_error(conn));
+        mysql_close(conn);
+        return 1;
     }
 
     MYSQL_RES *res = mysql_store_result(conn);

@@ -5,11 +5,16 @@
 #include <mysql/mysql.h>
 #include "/home/tools/setup_energy.c"
 
+static const char *MONTH_NAMES[] = {
+    "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+    "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
+};
+
 int main(int argc, char *argv[]) {
     // Controllo argomenti da riga di comando
     if (argc != 3) {
         fprintf(stderr, "Uso: %s <NOME_TABELLA_MYSQL> <ANNO_AAAA>\n", argv[0]);
-        fprintf(stderr, "Esempio: %s consumi_casa 2024\n", argv[0]);
+        fprintf(stderr, "Esempio: %s kwh_so 2024\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -55,8 +60,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    double monthly_kwh[12] = {0.0};
+    long monthly_samples[12] = {0};
+
     double hourly_kwh[24] = {0.0};
     long hourly_samples[24] = {0};
+
     double total_year_kwh = 0.0;
     long total_samples = 0;
 
@@ -72,13 +81,21 @@ int main(int argc, char *argv[]) {
 
         int row_year = tm_info.tm_year + 1900;
         if (row_year == target_year) {
-            int hour = tm_info.tm_hour; // Ora locale 0..23
+            int month = tm_info.tm_mon; // 0..11
+            int hour = tm_info.tm_hour;  // 0..23
+
+            if (month >= 0 && month < 12) {
+                monthly_kwh[month] += kwh;
+                monthly_samples[month]++;
+            }
+
             if (hour >= 0 && hour < 24) {
                 hourly_kwh[hour] += kwh;
                 hourly_samples[hour]++;
-                total_year_kwh += kwh;
-                total_samples++;
             }
+
+            total_year_kwh += kwh;
+            total_samples++;
         }
     }
 
@@ -86,15 +103,43 @@ int main(int argc, char *argv[]) {
     mysql_close(conn);
 
     if (total_samples == 0) {
-        printf("Nessun dato trovato per l'anno %d nella tabella '%s'.\n", target_year, table_name);
+        printf("\nNessun dato trovato per l'anno %d nella tabella '%s'.\n\n", target_year, table_name);
         return EXIT_SUCCESS;
     }
 
-    // Stampa del Report Finale
+    // =======================================================================
+    // TABELLA 1: VERIFICA PRESENZA MENSILE DEI DATI
+    // =======================================================================
     printf("\n");
     printf("=======================================================================\n");
-    printf(" ANALISI CONSUMI ORARI ANNO %d (Tabella: %s)\n", target_year, table_name);
-    printf(" Fuso Orario: Europe/Rome (Ora Locale)\n");
+    printf(" 1. RIEPILOGO MENSILE DATI (VERIFICA COMPLETEZZA ANNO %d)\n", target_year);
+    printf(" Tabella DB: %s | Fuso Orario: Europe/Rome\n", table_name);
+    printf("=======================================================================\n");
+    printf(" Mese        | Campioni (15m) | Totale kWh     | Stato Dati\n");
+    printf("-------------+----------------+----------------+-----------------------\n");
+
+    for (int m = 0; m < 12; m++) {
+        const char *status = "OK";
+        if (monthly_samples[m] == 0) {
+            status = "!! MANCANTE !!";
+        } else if (monthly_samples[m] < 2500) { // Un mese completo varia tra ~2688 e ~2977 campioni
+            status = "PARZIALE";
+        }
+
+        printf(" %-11s | %14ld | %14.4f | %s\n",
+               MONTH_NAMES[m], monthly_samples[m], monthly_kwh[m], status);
+    }
+
+    printf("-------------+----------------+----------------+-----------------------\n");
+    printf(" TOTALE ANNO | %14ld | %14.4f |\n", total_samples, total_year_kwh);
+    printf("=======================================================================\n");
+
+    // =======================================================================
+    // TABELLA 2: PROFILO DI CONSUMO ORARIO
+    // =======================================================================
+    printf("\n");
+    printf("=======================================================================\n");
+    printf(" 2. PROFILO DI CONSUMO ORARIO ANNO %d (Fasce 00:00 - 23:00)\n", target_year);
     printf("=======================================================================\n");
     printf(" Ora Locale   | Totale kWh     | Letture (15 min) | %% sul Totale Annuo\n");
     printf("--------------+----------------+------------------+--------------------\n");

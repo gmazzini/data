@@ -87,7 +87,7 @@ static int extract_json_value(const char *start, const char *end, const char *ke
   return 1;
 }
 
-// Robust JSON parser for Drive files.list response
+// Parse JSON response from Google Drive files.list
 static int parse_drive_files(const char *json, DriveFile *out_files, int max_files) {
   int count = 0;
   const char *files_sec = strstr(json, "\"files\"");
@@ -103,11 +103,9 @@ static int parse_drive_files(const char *json, DriveFile *out_files, int max_fil
     const char *obj_end = strchr(obj_start, '}');
     if (!obj_end) break;
 
-    // Extract id and name key values independently
     if (extract_json_value(obj_start, obj_end, "id", out_files[count].id, sizeof(out_files[count].id)) &&
         extract_json_value(obj_start, obj_end, "name", out_files[count].name, sizeof(out_files[count].name))) {
 
-      // Extract mimeType or set default if missing
       if (!extract_json_value(obj_start, obj_end, "mimeType", out_files[count].mime_type, sizeof(out_files[count].mime_type))) {
         strcpy(out_files[count].mime_type, "text/csv");
       }
@@ -116,6 +114,46 @@ static int parse_drive_files(const char *json, DriveFile *out_files, int max_fil
     }
 
     p = obj_end + 1;
+  }
+  return count;
+}
+
+// Strip quotes, spaces, newlines, and convert decimal commas to dots
+static void clean_val_str(const char *src, char *dst, size_t max_len) {
+  size_t j = 0;
+  for (size_t i = 0; src[i] != '\0' && j < max_len - 1; i++) {
+    char c = src[i];
+    if (c == '"' || c == '\'' || c == ' ' || c == '\r' || c == '\n') continue;
+    if (c == ',') c = '.';
+    dst[j++] = c;
+  }
+  dst[j] = '\0';
+}
+
+// Tokenize line respecting quoted delimiters and auto-detecting separator (; or ,)
+static int tokenize_line(char *line, char **tokens, int max_tokens) {
+  char sep = ';';
+  if (strchr(line, ';') == NULL && strchr(line, ',') != NULL) {
+    sep = ',';
+  }
+
+  int count = 0;
+  char *ptr = line;
+  char *start = ptr;
+  int in_quotes = 0;
+
+  while (*ptr && count < max_tokens) {
+    if (*ptr == '"') {
+      in_quotes = !in_quotes;
+    } else if (*ptr == sep && !in_quotes) {
+      *ptr = '\0';
+      tokens[count++] = start;
+      start = ptr + 1;
+    }
+    ptr++;
+  }
+  if (count < max_tokens) {
+    tokens[count++] = start;
   }
   return count;
 }
@@ -199,47 +237,29 @@ static int process_and_insert_csv(MYSQL *conn, const char *table_name, const cha
       continue;
     }
 
-    // Tokenize line by semicolon
     char *tokens[120];
-    int token_count = 0;
-    char *ptr = line;
-    char *start = ptr;
-
-    while (*ptr) {
-      if (*ptr == ';') {
-        *ptr = '\0';
-        tokens[token_count++] = start;
-        start = ptr + 1;
-      }
-      ptr++;
-    }
-    tokens[token_count++] = start;
+    int token_count = tokenize_line(line, tokens, 120);
 
     if (token_count >= 2) {
-      char date_str[32] = "";
-      if (sscanf(tokens[0], "\"%[^\"]\"", date_str) != 1) {
-        strncpy(date_str, tokens[0], sizeof(date_str) - 1);
-      }
+      char date_raw[64];
+      clean_val_str(tokens[0], date_raw, sizeof(date_raw));
 
       int day, month, year;
-      if (sscanf(date_str, "%d/%d/%d", &day, &month, &year) == 3) {
+      if (sscanf(date_raw, "%d/%d/%d", &day, &month, &year) == 3) {
 
-        int is_second_line_of_day = (strcmp(date_str, prev_date) == 0);
-        strncpy(prev_date, date_str, sizeof(prev_date) - 1);
+        int is_second_line_of_day = (strcmp(date_raw, prev_date) == 0);
+        strncpy(prev_date, date_raw, sizeof(prev_date) - 1);
 
         for (int i = 1; i < token_count && i <= 96; i++) {
 
           // Handle October DST transition (25-hour day split)
           if (is_second_line_of_day && i < 9) continue;
-          if (!is_second_line_of_day && month == 10 && i > 12 && strcmp(tokens[i], "0") == 0) continue;
 
-          // Convert decimal comma to dot
           char val_str[32];
-          strncpy(val_str, tokens[i], sizeof(val_str) - 1);
-          val_str[sizeof(val_str) - 1] = '\0';
-          for (char *c = val_str; *c; c++) {
-            if (*c == ',') *c = '.';
-          }
+          clean_val_str(tokens[i], val_str, sizeof(val_str));
+
+          if (!is_second_line_of_day && month == 10 && i > 12 && strcmp(val_str, "0") == 0) continue;
+
           double val = atof(val_str);
 
           int hour = (i - 1) / 4;

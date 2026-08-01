@@ -7,7 +7,7 @@
 #include <curl/curl.h>
 #include <mysql/mysql.h>
 
-// Include local energy setup configuration (provides DB credentials and helper functions)
+// Include local energy setup configuration (provides USER, PASSWORD, DB)
 #include "/home/tools/setup_energy.c"
 
 // Target configuration definitions
@@ -20,6 +20,26 @@ typedef struct {
     char *data;
     size_t size;
 } MemoryBuffer;
+
+// Determine ARERA tariff band index (1 = F1, 2 = F2, 3 = F3)
+static int get_band_index(const struct tm *t) {
+    int wday = t->tm_wday; // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+    int hour = t->tm_hour; // 0 .. 23
+
+    // Sunday is always F3
+    if (wday == 0) return 3;
+
+    // Saturday: 07:00-23:00 -> F2, rest -> F3
+    if (wday == 6) {
+        if (hour >= 7 && hour < 23) return 2;
+        return 3;
+    }
+
+    // Monday to Friday: 08:00-19:00 -> F1, 07:00-08:00 & 19:00-23:00 -> F2, night -> F3
+    if (hour >= 8 && hour < 19) return 1;
+    if ((hour >= 7 && hour < 8) || (hour >= 19 && hour < 23)) return 2;
+    return 3;
+}
 
 // Initialize dynamic memory buffer
 static void init_memory_buffer(MemoryBuffer *mem) {
@@ -146,7 +166,6 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
 }
 
 int main(int argc, char *argv[]) {
-    // Validate command-line arguments
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
         fprintf(stderr, "Example: %s kwh_so 2022\n", argv[0]);
@@ -166,7 +185,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Determine target Google Sheets tabs based on measure type
+    // Set timezone to Europe/Rome for accurate timestamp breakdown
+    setenv("TZ", "Europe/Rome", 1);
+    tzset();
+
     char hourly_tab[16], monthly_tab[16];
     if (strcmp(measure_type, "kwh_so") == 0) {
         strcpy(hourly_tab, "h_so");
@@ -176,54 +198,55 @@ int main(int argc, char *argv[]) {
         strcpy(monthly_tab, "m_cc");
     }
 
-    // Read Google OAuth2 Bearer token
     char access_token[512];
     if (!read_access_token(TOKEN_FILE, access_token, sizeof(access_token))) {
         return 1;
     }
 
-    // Connect to MySQL database using parameters from setup_energy.c
+    // Connect to MySQL database using USER, PASSWORD, DB from setup_energy.c
     MYSQL *conn = mysql_init(NULL);
     if (!conn) {
-        fprintf(stderr, "MySQL init failed\n");
+        fprintf(stderr, "mysql init error\n");
         return 1;
     }
 
-    if (!mysql_real_connect(conn, DB_HOST, DB_USER, DB_PASS, DB_NAME, 0, NULL, 0)) {
-        fprintf(stderr, "MySQL connection error: %s\n", mysql_error(conn));
+    if (mysql_real_connect(conn, "localhost", USER, PASSWORD, DB, 0, NULL, 0) == NULL) {
+        fprintf(stderr, "mysql connect error: %s\n", mysql_error(conn));
         mysql_close(conn);
         return 1;
     }
 
-    // Prepare Unix timestamps for target year limits in Europe/Rome
     struct tm start_tm = {0}, end_tm = {0};
     start_tm.tm_year = target_year - 1900;
     start_tm.tm_mon = 0;
     start_tm.tm_mday = 1;
-    
+    start_tm.tm_hour = 0;
+    start_tm.tm_min = 0;
+    start_tm.tm_sec = 0;
+    start_tm.tm_isdst = -1;
+
     end_tm.tm_year = target_year - 1900;
     end_tm.tm_mon = 11;
     end_tm.tm_mday = 31;
     end_tm.tm_hour = 23;
     end_tm.tm_min = 59;
     end_tm.tm_sec = 59;
+    end_tm.tm_isdst = -1;
 
     time_t start_epoch = mktime(&start_tm);
     time_t end_epoch = mktime(&end_tm);
 
-    // Query MySQL table (energy_15m or pun_15m depending on system schema)
     char query[1024];
     snprintf(query, sizeof(query),
              "SELECT epoch, %s FROM energy_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
              measure_type, (long)start_epoch, (long)end_epoch);
 
     if (mysql_query(conn, query)) {
-        // Fallback to pun_15m table if energy_15m is not found
         snprintf(query, sizeof(query),
                  "SELECT epoch, %s FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
                  measure_type, (long)start_epoch, (long)end_epoch);
         if (mysql_query(conn, query)) {
-            fprintf(stderr, "MySQL query failed: %s\n", mysql_error(conn));
+            fprintf(stderr, "mysql query error: %s\n", mysql_error(conn));
             mysql_close(conn);
             return 1;
         }
@@ -231,17 +254,16 @@ int main(int argc, char *argv[]) {
 
     MYSQL_RES *res = mysql_store_result(conn);
     if (!res) {
-        fprintf(stderr, "MySQL store result error: %s\n", mysql_error(conn));
+        fprintf(stderr, "mysql store result error: %s\n", mysql_error(conn));
         mysql_close(conn);
         return 1;
     }
 
-    // Initialize accumulation metrics
     double hourly_sum[24] = {0.0};
     double hourly_total = 0.0;
     
-    double monthly_sum[12][4] = {{0.0}};      // [month][0:F1, 1:F2, 2:F3, 3:Totale]
-    double monthly_annual_totals[4] = {0.0};  // [0:F1, 1:F2, 2:F3, 3:Totale]
+    double monthly_sum[12][4] = {{0.0}};
+    double monthly_annual_totals[4] = {0.0};
 
     MYSQL_ROW row;
     while ((row = mysql_fetch_row(res))) {
@@ -253,25 +275,22 @@ int main(int argc, char *argv[]) {
         struct tm *t = localtime(&ep);
         if (!t) continue;
 
-        int hour = t->tm_hour;   // 0 .. 23
-        int month = t->tm_mon;   // 0 .. 11
+        int hour = t->tm_hour;
+        int month = t->tm_mon;
 
-        // Determine ARERA tariff band index (1 for F1, 2 for F2, 3 for F3)
         int band = get_band_index(t);
 
-        // Accumulate hourly values
         if (hour >= 0 && hour < 24) {
             hourly_sum[hour] += val;
             hourly_total += val;
         }
 
-        // Accumulate monthly values
         if (month >= 0 && month < 12 && band >= 1 && band <= 3) {
-            monthly_sum[month][band - 1] += val; // Band-specific sum
-            monthly_sum[month][3] += val;        // Monthly total sum
+            monthly_sum[month][band - 1] += val;
+            monthly_sum[month][3] += val;
             
-            monthly_annual_totals[band - 1] += val; // Annual band total
-            monthly_annual_totals[3] += val;        // Annual grand total
+            monthly_annual_totals[band - 1] += val;
+            monthly_annual_totals[3] += val;
         }
     }
 
@@ -283,10 +302,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // -------------------------------------------------------------
-    // 1. UPDATE HOURLY SHEET (h_so / h_cc)
-    // -------------------------------------------------------------
-    int hourly_col_idx = 2 + (target_year - BASE_YEAR); // Col B=2021, C=2022...
+    // 1. UPDATE HOURLY TAB (es. C2:C26 per il 2022)
+    int hourly_col_idx = 2 + (target_year - BASE_YEAR);
     char hourly_col_letter[16];
     get_column_letter(hourly_col_idx, hourly_col_letter);
 
@@ -307,10 +324,8 @@ int main(int argc, char *argv[]) {
         free(json_h);
     }
 
-    // -------------------------------------------------------------
-    // 2. UPDATE MONTHLY SHEET (m_so / m_cc)
-    // -------------------------------------------------------------
-    int start_m_col = 2 + (target_year - BASE_YEAR) * 4; // 2021=B(2), 2022=F(6)...
+    // 2. UPDATE MONTHLY TAB (es. F2:I14 per il 2022)
+    int start_m_col = 2 + (target_year - BASE_YEAR) * 4;
     int end_m_col = start_m_col + 3;
 
     char start_m_letter[16], end_m_letter[16];

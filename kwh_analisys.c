@@ -20,13 +20,69 @@ typedef struct {
     size_t size;
 } MemoryBuffer;
 
+// Calculate Easter Monday date for a given year using Anonymous Gauss algorithm
+static void get_easter_monday(int year, int *out_m, int *out_d) {
+    int a = year % 19;
+    int b = year / 100;
+    int c = year % 100;
+    int d = b / 4;
+    int e = b % 4;
+    int f = (b + 8) / 25;
+    int g = (b - f + 1) / 3;
+    int h = (19 * a + b - d - g + 15) % 30;
+    int i = c / 4;
+    int k = c % 4;
+    int l = (32 + 2 * e + 2 * i - h - k) % 7;
+    int m = (a + 11 * h + 22 * l) / 451;
+    int month_e = (h + l - 7 * m + 114) / 31;
+    int day_e = ((h + l - 7 * m + 114) % 31) + 1;
+
+    if (month_e == 3) {
+        if (day_e < 31) {
+            *out_m = 3;
+            *out_d = day_e + 1;
+        } else {
+            *out_m = 4;
+            *out_d = 1;
+        }
+    } else {
+        *out_m = 4;
+        *out_d = day_e + 1;
+    }
+}
+
+// Check if a date is an Italian national holiday
+static int is_festivo(const struct tm *tm) {
+    int m = tm->tm_mon + 1;
+    int d = tm->tm_mday;
+    int y = tm->tm_year + 1900;
+
+    // Fixed Italian holidays
+    if ((m == 1 && d == 1) || (m == 1 && d == 6) ||
+        (m == 4 && d == 25) || (m == 5 && d == 1) ||
+        (m == 6 && d == 2) || (m == 8 && d == 15) ||
+        (m == 11 && d == 1) || (m == 12 && d == 8) ||
+        (m == 12 && d == 25) || (m == 12 && d == 26)) {
+        return 1;
+    }
+
+    // Dynamic holiday: Easter Monday
+    int em_m = 0, em_d = 0;
+    get_easter_monday(y, &em_m, &em_d);
+    if (m == em_m && d == em_d) {
+        return 1;
+    }
+
+    return 0;
+}
+
 // Determine ARERA tariff band index (1 = F1, 2 = F2, 3 = F3)
 static int get_band_index(const struct tm *t) {
     int wday = t->tm_wday; // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
     int hour = t->tm_hour; // 0 .. 23
 
-    // Sunday is always F3
-    if (wday == 0) return 3;
+    // Sunday or National Holiday is always F3
+    if (wday == 0 || is_festivo(t)) return 3;
 
     // Saturday: 07:00-23:00 -> F2, rest -> F3
     if (wday == 6) {
@@ -179,7 +235,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Impostazione dell'anno di partenza dinamico
     int base_year = (strcmp(measure_type, "kwh_so") == 0) ? 2021 : 2024;
 
     if (target_year < base_year || target_year > 2099) {
@@ -187,7 +242,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Set timezone to Europe/Rome for accurate timestamp breakdown
     setenv("TZ", "Europe/Rome", 1);
     tzset();
 
@@ -205,7 +259,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Connect to MySQL database using USER, PASSWORD, DB from setup_energy.c
     MYSQL *conn = mysql_init(NULL);
     if (!conn) {
         fprintf(stderr, "mysql init error\n");
@@ -238,7 +291,6 @@ int main(int argc, char *argv[]) {
     time_t start_epoch = mktime(&start_tm);
     time_t end_epoch = mktime(&end_tm);
 
-    // Query per la tabella selezionata (kwh_so oppure kwh_cc)
     char query[1024];
     snprintf(query, sizeof(query),
              "SELECT epoch, kwh FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
@@ -301,7 +353,6 @@ int main(int argc, char *argv[]) {
     }
 
     // 1. UPDATE HOURLY TAB
-    // SO: Colonna B (idx 2) = 2021 | CC: Colonna B (idx 2) = 2024
     int hourly_col_idx = 2 + (target_year - base_year);
     char hourly_col_letter[16];
     get_column_letter(hourly_col_idx, hourly_col_letter);
@@ -324,7 +375,6 @@ int main(int argc, char *argv[]) {
     }
 
     // 2. UPDATE MONTHLY TAB
-    // SO: B..E (2021), F..I (2022) | CC: B..E (2024), F..I (2025)
     int start_m_col = 2 + (target_year - base_year) * 4;
     int end_m_col = start_m_col + 3;
 

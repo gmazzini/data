@@ -8,7 +8,7 @@
 #define TOKEN_FILE "/home/www/data/google_access_token"
 
 // Google Sheets configuration constants
-#define SPREADSHEET_ID "1RF4N-T2NR2UHai70AzTzwuLXowkLlOQWvFyb8AaE1xg"
+#define SPREADSHEET_ID "1fw-Nq7RPMs9JF4bb62LGrXuqg81v1bPJjupOmGsCCqg
 #define SHEET_NAME "pun"
 
 // Buffer structure to hold API HTTP response body

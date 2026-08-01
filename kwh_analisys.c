@@ -1,3 +1,4 @@
+// Include standard C libraries and MySQL header
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,50 +6,47 @@
 #include <mysql/mysql.h>
 #include "/home/tools/setup_energy.c"
 
+// Month names in Italian for table output
 static const char *MONTH_NAMES[] = {
     "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
     "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
 };
 
-// Verifica festività nazionali italiane
+// Check national holidays in Italy
 int is_festivo_nazionale(int mday, int mon) {
-    // mon va da 0 (Gennaio) a 11 (Dicembre)
-    if ((mday == 1  && mon == 0)  || // Capodanno
-        (mday == 6  && mon == 0)  || // Epifania
-        (mday == 25 && mon == 3)  || // Liberazione
-        (mday == 1  && mon == 4)  || // Festa del Lavoro
-        (mday == 2  && mon == 5)  || // Festa della Repubblica
+    if ((mday == 1  && mon == 0)  || // New Year
+        (mday == 6  && mon == 0)  || // Epiphany
+        (mday == 25 && mon == 3)  || // Liberation Day
+        (mday == 1  && mon == 4)  || // Labor Day
+        (mday == 2  && mon == 5)  || // Republic Day
         (mday == 15 && mon == 7)  || // Ferragosto
-        (mday == 1  && mon == 10) || // Ognissanti
-        (mday == 8  && mon == 11) || // Immacolata
-        (mday == 25 && mon == 11) || // Natale
-        (mday == 26 && mon == 11))   // Santo Stefano
+        (mday == 1  && mon == 10) || // All Saints
+        (mday == 8  && mon == 11) || // Immaculate Conception
+        (mday == 25 && mon == 11) || // Christmas
+        (mday == 26 && mon == 11))   // St. Stephen
     {
         return 1;
     }
     return 0;
 }
 
-// Determina la fascia oraria (1 = F1, 2 = F2, 3 = F3)
+// Determine tariff band (1 = F1, 2 = F2, 3 = F3)
 int get_fascia_oraria(int wday, int mday, int mon, int hour) {
-    // Domenica (0) o Festivi -> F3
     if (wday == 0 || is_festivo_nazionale(mday, mon)) {
         return 3;
     }
-    // Da Lunedì a Venerdì (1..5)
-    if (wday >= 1 && wday <= 5) {
+    if (wday >= 1 && wday <= 5) { // Monday to Friday
         if (hour >= 8 && hour < 19) return 1;
         else if ((hour >= 7 && hour < 8) || (hour >= 19 && hour < 23)) return 2;
         else return 3;
-    } 
-    // Sabato (6)
-    else {
+    } else { // Saturday
         if (hour >= 7 && hour < 23) return 2;
         else return 3;
     }
 }
 
 int main(int argc, char *argv[]) {
+    // Check command line arguments
     if (argc != 3) {
         fprintf(stderr, "Uso: %s <NOME_TABELLA_MYSQL> <ANNO_AAAA>\n", argv[0]);
         fprintf(stderr, "Esempio: %s kwh_so 2024\n", argv[0]);
@@ -63,11 +61,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Imposta il fuso orario locale su Europe/Rome (gestione automatica CET/CEST)
+    // Set local timezone to Europe/Rome
     setenv("TZ", "Europe/Rome", 1);
     tzset();
 
-    // Connessione a MySQL con le credenziali da setup_energy.c
+    // Initialize MySQL connection
     MYSQL *conn = mysql_init(NULL);
     if (!conn) {
         fprintf(stderr, "Errore inizializzazione MySQL\n");
@@ -80,7 +78,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Query per recuperare tutti i record di epoch e kwh
+    // Execute query to retrieve epoch and kwh
     char query[1024];
     snprintf(query, sizeof(query), "SELECT epoch, kwh FROM `%s`", table_name);
 
@@ -97,15 +95,13 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Strutture per l'accumulo dei consumi
+    // Accumulation arrays
     double monthly_kwh[12] = {0.0};
     double monthly_f1[12]  = {0.0};
     double monthly_f2[12]  = {0.0};
     double monthly_f3[12]  = {0.0};
-    long monthly_samples[12] = {0};
 
     double hourly_kwh[24] = {0.0};
-    long hourly_samples[24] = {0};
 
     double total_year_kwh = 0.0;
     double total_year_f1  = 0.0;
@@ -137,12 +133,10 @@ int main(int argc, char *argv[]) {
                 else if (fascia == 3) monthly_f3[month] += kwh;
 
                 monthly_kwh[month] += kwh;
-                monthly_samples[month]++;
             }
 
             if (hour >= 0 && hour < 24) {
                 hourly_kwh[hour] += kwh;
-                hourly_samples[hour]++;
             }
 
             total_year_kwh += kwh;
@@ -150,7 +144,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Calcolo totali annuali per fascia
+    // Aggregate annual band totals
     for (int m = 0; m < 12; m++) {
         total_year_f1 += monthly_f1[m];
         total_year_f2 += monthly_f2[m];
@@ -165,53 +159,40 @@ int main(int argc, char *argv[]) {
         return EXIT_SUCCESS;
     }
 
-    // =======================================================================
-    // TABELLA 1: RIEPILOGO MENSILE E FASCE (F1, F2, F3)
-    // =======================================================================
+    // Table 1: Monthly summary with F1, F2, F3 breakdown
     printf("\n");
-    printf("===================================================================================================\n");
+    printf("===================================================================\n");
     printf(" 1. RIEPILOGO MENSILE E FASCE ORARIE (ANNO %d)\n", target_year);
     printf(" Tabella DB: %s | Fuso Orario: Europe/Rome\n", table_name);
-    printf("===================================================================================================\n");
-    printf(" Mese        | F1 (kWh)     | F2 (kWh)     | F3 (kWh)     | TOTALE (kWh) | Campioni | Stato Dati  \n");
-    printf("-------------+--------------+--------------+--------------+--------------+----------+--------------\n");
+    printf("===================================================================\n");
+    printf(" Mese        | F1 (kWh)     | F2 (kWh)     | F3 (kWh)     | TOTALE (kWh)\n");
+    printf("-------------+--------------+--------------+--------------+--------------\n");
 
     for (int m = 0; m < 12; m++) {
-        const char *status = "OK";
-        if (monthly_samples[m] == 0) {
-            status = "!! MANCANTE !!";
-        } else if (monthly_samples[m] < 2500) {
-            status = "PARZIALE";
-        }
-
-        printf(" %-11s | %12.2f | %12.2f | %12.2f | %12.2f | %8ld | %s\n",
-               MONTH_NAMES[m], monthly_f1[m], monthly_f2[m], monthly_f3[m], monthly_kwh[m], monthly_samples[m], status);
+        printf(" %-11s | %12.2f | %12.2f | %12.2f | %12.2f\n",
+               MONTH_NAMES[m], monthly_f1[m], monthly_f2[m], monthly_f3[m], monthly_kwh[m]);
     }
 
-    printf("-------------+--------------+--------------+--------------+--------------+----------+--------------\n");
-    printf(" TOTALE ANNO | %12.2f | %12.2f | %12.2f | %12.2f | %8ld |\n", 
-           total_year_f1, total_year_f2, total_year_f3, total_year_kwh, total_samples);
-    printf("===================================================================================================\n");
+    printf("-------------+--------------+--------------+--------------+--------------\n");
+    printf(" TOTALE ANNO | %12.2f | %12.2f | %12.2f | %12.2f\n", 
+           total_year_f1, total_year_f2, total_year_f3, total_year_kwh);
+    printf("===================================================================\n");
 
-    // =======================================================================
-    // TABELLA 2: PROFILO DI CONSUMO ORARIO
-    // =======================================================================
+    // Table 2: Hourly profile displaying only start hour
     printf("\n");
-    printf("=======================================================================\n");
-    printf(" 2. PROFILO DI CONSUMO ORARIO ANNO %d (Fasce 00:00 - 23:00)\n", target_year);
-    printf("=======================================================================\n");
-    printf(" Ora Locale   | Totale kWh      | Letture (15 min) | %% sul Totale Annuo\n");
-    printf("--------------+-----------------+------------------+--------------------\n");
+    printf("=======================================\n");
+    printf(" 2. PROFILO DI CONSUMO ORARIO ANNO %d\n", target_year);
+    printf("=======================================\n");
+    printf(" Ora   | Totale kWh\n");
+    printf("-------+-------------------------------\n");
 
     for (int h = 0; h < 24; h++) {
-        double pct = (total_year_kwh > 0.0) ? (hourly_kwh[h] / total_year_kwh) * 100.0 : 0.0;
-        printf("  %02d:00 - %02d:00 | %15.4f | %16ld | %17.2f%%\n",
-               h, (h + 1) % 24, hourly_kwh[h], hourly_samples[h], pct);
+        printf(" %02d:00 | %14.4f\n", h, hourly_kwh[h]);
     }
 
-    printf("--------------+-----------------+------------------+--------------------\n");
-    printf("  TOTALE      | %15.4f | %16ld |             100.00%%\n", total_year_kwh, total_samples);
-    printf("=======================================================================\n\n");
+    printf("-------+-------------------------------\n");
+    printf(" TOTALE| %14.4f\n", total_year_kwh);
+    printf("=======================================\n\n");
 
     return EXIT_SUCCESS;
 }

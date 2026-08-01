@@ -61,64 +61,61 @@ static int read_access_token(char *buf, size_t buflen) {
   return 1;
 }
 
-// Parse JSON response from Google Drive files.list
+// Extract a JSON string value by key within a given range [start, end]
+static int extract_json_value(const char *start, const char *end, const char *key, char *out_val, size_t max_len) {
+  char search_key[128];
+  snprintf(search_key, sizeof(search_key), "\"%s\"", key);
+
+  const char *p = strstr(start, search_key);
+  if (!p || p >= end) return 0;
+
+  const char *colon = strchr(p, ':');
+  if (!colon || colon >= end) return 0;
+
+  const char *q1 = strchr(colon, '"');
+  if (!q1 || q1 >= end) return 0;
+  q1++;
+
+  const char *q2 = strchr(q1, '"');
+  if (!q2 || q2 >= end) return 0;
+
+  size_t len = q2 - q1;
+  if (len >= max_len) len = max_len - 1;
+
+  memcpy(out_val, q1, len);
+  out_val[len] = '\0';
+  return 1;
+}
+
+// Robust JSON parser for Drive files.list response
 static int parse_drive_files(const char *json, DriveFile *out_files, int max_files) {
   int count = 0;
   const char *files_sec = strstr(json, "\"files\"");
   if (!files_sec) return 0;
 
-  const char *p = files_sec;
+  const char *p = strstr(files_sec, "[");
+  if (!p) return 0;
+
   while (count < max_files) {
-    const char *id_key = strstr(p, "\"id\"");
-    if (!id_key) break;
+    const char *obj_start = strchr(p, '{');
+    if (!obj_start) break;
 
-    const char *colon1 = strchr(id_key, ':');
-    if (!colon1) break;
-    const char *q1 = strchr(colon1, '"');
-    if (!q1) break;
-    q1++;
-    const char *q2 = strchr(q1, '"');
-    if (!q2) break;
+    const char *obj_end = strchr(obj_start, '}');
+    if (!obj_end) break;
 
-    const char *name_key = strstr(q2, "\"name\"");
-    if (!name_key) break;
-    const char *colon2 = strchr(name_key, ':');
-    if (!colon2) break;
-    const char *q3 = strchr(colon2, '"');
-    if (!q3) break;
-    q3++;
-    const char *q4 = strchr(q3, '"');
-    if (!q4) break;
+    // Extract id and name key values independently
+    if (extract_json_value(obj_start, obj_end, "id", out_files[count].id, sizeof(out_files[count].id)) &&
+        extract_json_value(obj_start, obj_end, "name", out_files[count].name, sizeof(out_files[count].name))) {
 
-    const char *mime_key = strstr(q4, "\"mimeType\"");
-    if (!mime_key) break;
-    const char *colon3 = strchr(mime_key, ':');
-    if (!colon3) break;
-    const char *q5 = strchr(colon3, '"');
-    if (!q5) break;
-    q5++;
-    const char *q6 = strchr(q5, '"');
-    if (!q6) break;
-
-    size_t id_len = q2 - q1;
-    size_t name_len = q4 - q3;
-    size_t mime_len = q6 - q5;
-
-    if (id_len < sizeof(out_files[count].id) && 
-        name_len < sizeof(out_files[count].name) &&
-        mime_len < sizeof(out_files[count].mime_type)) {
-      memcpy(out_files[count].id, q1, id_len);
-      out_files[count].id[id_len] = '\0';
-
-      memcpy(out_files[count].name, q3, name_len);
-      out_files[count].name[name_len] = '\0';
-
-      memcpy(out_files[count].mime_type, q5, mime_len);
-      out_files[count].mime_type[mime_len] = '\0';
+      // Extract mimeType or set default if missing
+      if (!extract_json_value(obj_start, obj_end, "mimeType", out_files[count].mime_type, sizeof(out_files[count].mime_type))) {
+        strcpy(out_files[count].mime_type, "text/csv");
+      }
 
       count++;
     }
-    p = q6 + 1;
+
+    p = obj_end + 1;
   }
   return count;
 }
@@ -268,7 +265,7 @@ static int process_and_insert_csv(MYSQL *conn, const char *table_name, const cha
           time_t epoch = mktime(&tm_info);
           if (epoch == -1) continue;
 
-          // Insert record using epoch and kwh columns
+          // Insert query matching epoch and kwh columns
           char query[1024];
           snprintf(query, sizeof(query),
             "INSERT INTO `%s` (epoch, kwh) "

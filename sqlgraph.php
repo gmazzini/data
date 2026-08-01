@@ -1,7 +1,6 @@
 <?php
 // sqlgraph.php - Responsive chart rendering script
 
-// Imposta il fuso orario predefinito su Ora Italiana
 date_default_timezone_set('Europe/Rome');
 
 $local_config = getcwd() . '/local.php';
@@ -27,10 +26,47 @@ function build_q_param(DateTime $dt, string $mode): string {
 
 $tz_rome = new DateTimeZone('Europe/Rome');
 
-// Parse active period or fallback to today
+// 1. Interroga il DB per trovare l'ultimo epoch disponibile tra le tabelle configurate
+$max_epoch = time(); // fallback all'ora attuale
+$conn_max = @mysqli_connect($db_host, $db_user, $db_pass, $db_name);
+
+if ($conn_max && isset($tab) && is_array($tab)) {
+    @mysqli_set_charset($conn_max, "utf8mb4");
+    $maxParts = [];
+
+    foreach ($tab as $t) {
+        $tbl = preg_replace('/[^A-Za-z0-9_]/', '', $t["table"]);
+        $where = "1=1";
+        if (isset($t["device"])) {
+            $dev = mysqli_real_escape_string($conn_max, $t["device"]);
+            $where .= " AND device = '$dev'";
+        }
+        $maxParts[] = "SELECT MAX(epoch) AS max_e FROM `$tbl` WHERE $where";
+    }
+
+    if (!empty($maxParts)) {
+        $sqlMax = "SELECT MAX(max_e) AS global_max FROM (" . implode(" UNION ", $maxParts) . ") tmp";
+        $resMax = @mysqli_query($conn_max, $sqlMax);
+        if ($resMax && $rowMax = mysqli_fetch_assoc($resMax)) {
+            if (!empty($rowMax['global_max'])) {
+                $max_epoch = (int)$rowMax['global_max'];
+            }
+        }
+    }
+    @mysqli_close($conn_max);
+}
+
+// 2. Definizione del periodo massimo consentito (basato sul DB) e di TODAY (giorno solare attuale)
+$dt_max = new DateTime('@' . $max_epoch);
+$dt_max->setTimezone($tz_rome);
+$dt_max->setTime(0, 0, 0);
+
+$dt_today = new DateTime('now', $tz_rome);
+$dt_today->setTime(0, 0, 0);
+
+// Parse del parametro active period o fallback all'ultimo giorno disponibile a DB
 $current_mode = 'd';
-$dt = new DateTime('now', $tz_rome);
-$dt->setTime(0, 0, 0);
+$dt = clone $dt_max;
 
 if (preg_match('/^(\d{4})([dwm])(\d+)$/', $q_raw, $m)) {
     $year = (int)$m[1];
@@ -38,8 +74,8 @@ if (preg_match('/^(\d{4})([dwm])(\d+)$/', $q_raw, $m)) {
     $num  = (int)$m[3];
     $current_mode = $type;
 
+    $dt->setDate($year, 1, 1);
     if ($type === 'd') {
-        $dt->setDate($year, 1, 1);
         $dt->modify("+$num days");
     } else if ($type === 'w') {
         $dt->setISODate($year, $num, 1);
@@ -48,25 +84,22 @@ if (preg_match('/^(\d{4})([dwm])(\d+)$/', $q_raw, $m)) {
     }
 }
 
-// Determine maximum allowed limit
-$dt_now = new DateTime('now', $tz_rome);
-$dt_now->setTime(0, 0, 0);
-
+// Calcola il limite di navigazione in base alla modalità (D/W/M)
 if ($current_mode === 'w') {
-    $dt_max = clone $dt_now;
-    $dt_max->setISODate((int)$dt_now->format('Y'), (int)$dt_now->format('W'), 1);
+    $limit_dt = clone $dt_max;
+    $limit_dt->setISODate((int)$dt_max->format('Y'), (int)$dt_max->format('W'), 1);
 } else if ($current_mode === 'm') {
-    $dt_max = clone $dt_now;
-    $dt_max->setDate((int)$dt_now->format('Y'), (int)$dt_now->format('n'), 1);
+    $limit_dt = clone $dt_max;
+    $limit_dt->setDate((int)$dt_max->format('Y'), (int)$dt_max->format('n'), 1);
 } else {
-    $dt_max = clone $dt_now;
+    $limit_dt = clone $dt_max;
 }
 
-if ($dt > $dt_max) {
-    $dt = clone $dt_max;
+if ($dt > $limit_dt) {
+    $dt = clone $limit_dt;
 }
 
-// Calculate Previous and Next periods
+// Calcolo periodi Precedente e Successivo
 $dt_prev = clone $dt;
 $dt_next = clone $dt;
 
@@ -81,12 +114,12 @@ if ($current_mode === 'w') {
     $dt_next->modify('+1 day');
 }
 
-$is_future = ($dt_next > $dt_max);
+$is_future = ($dt_next > $limit_dt);
 
-$q_prev = build_q_param($dt_prev, $current_mode);
-$q_next = build_q_param($dt_next, $current_mode);
-$q = build_q_param($dt, $current_mode);
-$q_act = build_q_param($dt_max, $current_mode);
+$q_prev  = build_q_param($dt_prev, $current_mode);
+$q_next  = build_q_param($dt_next, $current_mode);
+$q       = build_q_param($dt, $current_mode);
+$q_today = build_q_param($dt_today, $current_mode);
 
 $q_mode_d = build_q_param($dt, 'd');
 $q_mode_w = build_q_param($dt, 'w');
@@ -106,7 +139,7 @@ if ($current_mode === 'w') {
 
 $h_axis_title = "Data / Ora (Ora Italiana)";
 
-// Execute data processing module
+// Elaborazione dati con sqlproc.php
 $labels = $labels ?? [];
 $seriesOpt = $seriesOpt ?? [];
 $axisTitleLeft = $axisTitleLeft ?? "";
@@ -133,7 +166,6 @@ $rowsText = trim($dataRows);
 $rowsText = rtrim($rowsText, ", \r\n\t");
 
 $rows = [];
-
 if ($rowsText !== "") {
     $jsonish = "[" . preg_replace("/'/", "\"", $rowsText) . "]";
     $rows = json_decode($jsonish, true);
@@ -144,7 +176,6 @@ if ($rowsText !== "") {
 }
 
 $dataRowsJs = [];
-
 foreach ($rows as $r) {
     $out = [];
     $out[] = json_encode($r[0] ?? "", JSON_UNESCAPED_UNICODE);
@@ -168,7 +199,6 @@ $axisRange = $axisRange ?? [
 ];
 
 $vAxes = [];
-
 for ($axis = 0; $axis <= 1; $axis++) {
     $vAxes[$axis] = [
         'title' => ($axis === 0) ? $axisTitleLeft : $axisTitleRight
@@ -201,7 +231,6 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <!-- CRUCIALE PER MOBILE: imposta la larghezza della viewport al dispositivo reale -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title><?= htmlspecialchars($title, ENT_QUOTES, 'UTF-8') ?></title>
   <style>
@@ -213,7 +242,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-toolbar {
       display: flex;
-      flex-wrap: wrap; /* Permette il wrap pulito su schermi molto stretti */
+      flex-wrap: wrap;
       align-items: center;
       gap: 4px;
       background: #f1f3f5;
@@ -225,7 +254,7 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     }
     .nav-btn {
       display: inline-block;
-      padding: 4px 8px; /* Area touch leggermente più grande per le dita */
+      padding: 4px 8px;
       background: #ffffff;
       color: #333333;
       text-decoration: none;
@@ -263,7 +292,6 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
     google.charts.load('current', {packages:['corechart']});
     google.charts.setOnLoadCallback(drawChart);
 
-    // Ridisegna automaticamente il grafico ad ogni cambio di orientamento o resize della finestra
     window.addEventListener('resize', drawChart);
 
     function drawChart() {
@@ -279,7 +307,6 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
         <?= $dataRowsFinal !== "" ? "\n        " . $dataRowsFinal . "\n      " : "" ?>
       ]);
 
-      // Rileva se lo schermo è in formato mobile (< 600px)
       const isMobile = window.innerWidth < 600;
 
       const options = {
@@ -289,24 +316,20 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
           position: 'top',
           textStyle: { fontSize: isMobile ? 10 : 12 }
         },
-
-        // Layout adattivo per prevenire il taglio delle etichette
         chartArea: {
           top: isMobile ? 35 : 30,
-          left: isMobile ? 45 : '5%',     // Margine in pixel fissi su mobile per garantire spazio alle cifre Y
+          left: isMobile ? 45 : '5%',
           right: isMobile ? 15 : '3%',
-          bottom: isMobile ? 90 : 110,   // Spazio sufficiente per le etichette inclined a 60 gradi
+          bottom: isMobile ? 90 : 110,
           width: isMobile ? '85%' : '92%',
           height: isMobile ? '65%' : '70%'
         },
-
         hAxis: {
           title: <?= json_encode($h_axis_title, JSON_UNESCAPED_UNICODE) ?>,
           slantedText: true,
           slantedTextAngle: 60,
           textStyle: { fontSize: isMobile ? 9 : 11 }
         },
-
         vAxes: <?= $vAxesJs ?>,
         series: <?= $seriesOptJs ?>
       };
@@ -322,11 +345,11 @@ $seriesOptJs = json_encode((object)$seriesOpt, JSON_UNESCAPED_UNICODE);
   <div class="nav-toolbar">
     <a href="?q=<?= $q_prev ?>" class="nav-btn" title="Previous">&laquo;</a>
     <?php if ($is_future): ?>
-      <span class="nav-btn disabled" title="Future period not available">&raquo;</span>
+      <span class="nav-btn disabled" title="Limit reached">&raquo;</span>
     <?php else: ?>
       <a href="?q=<?= $q_next ?>" class="nav-btn" title="Next">&raquo;</a>
     <?php endif; ?>
-    <a href="?q=<?= $q_act ?>" class="nav-btn nav-btn-act" title="Current Date">ACT</a>
+    <a href="?q=<?= $q_today ?>" class="nav-btn nav-btn-act" title="Current Real Date">TODAY</a>
     &nbsp;|
     <a href="?q=<?= $q_mode_d ?>" class="nav-btn <?= $current_mode === 'd' ? 'active' : '' ?>">DAY</a>
     <a href="?q=<?= $q_mode_w ?>" class="nav-btn <?= $current_mode === 'w' ? 'active' : '' ?>">WEEK</a>

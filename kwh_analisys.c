@@ -57,7 +57,6 @@ static int is_festivo(const struct tm *tm) {
     int d = tm->tm_mday;
     int y = tm->tm_year + 1900;
 
-    // Fixed Italian holidays
     if ((m == 1 && d == 1) || (m == 1 && d == 6) ||
         (m == 4 && d == 25) || (m == 5 && d == 1) ||
         (m == 6 && d == 2) || (m == 8 && d == 15) ||
@@ -66,7 +65,6 @@ static int is_festivo(const struct tm *tm) {
         return 1;
     }
 
-    // Dynamic holiday: Easter Monday
     int em_m = 0, em_d = 0;
     get_easter_monday(y, &em_m, &em_d);
     if (m == em_m && d == em_d) {
@@ -78,34 +76,27 @@ static int is_festivo(const struct tm *tm) {
 
 // Determine ARERA tariff band index (1 = F1, 2 = F2, 3 = F3)
 static int get_band_index(const struct tm *t) {
-    int wday = t->tm_wday; // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-    int hour = t->tm_hour; // 0 .. 23
+    int wday = t->tm_wday;
+    int hour = t->tm_hour;
 
-    // Sunday or National Holiday is always F3
     if (wday == 0 || is_festivo(t)) return 3;
 
-    // Saturday: 07:00-23:00 -> F2, rest -> F3
     if (wday == 6) {
         if (hour >= 7 && hour < 23) return 2;
         return 3;
     }
 
-    // Monday to Friday: 08:00-19:00 -> F1, 07:00-08:00 & 19:00-23:00 -> F2, night -> F3
     if (hour >= 8 && hour < 19) return 1;
     if ((hour >= 7 && hour < 8) || (hour >= 19 && hour < 23)) return 2;
     return 3;
 }
 
-// Initialize dynamic memory buffer
 static void init_memory_buffer(MemoryBuffer *mem) {
     mem->size = 0;
     mem->data = (char *)malloc(1);
-    if (mem->data) {
-        mem->data[0] = '\0';
-    }
+    if (mem->data) mem->data[0] = '\0';
 }
 
-// Libcurl write callback to append received response bytes
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     MemoryBuffer *mem = (MemoryBuffer *)userp;
@@ -120,7 +111,6 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return realsize;
 }
 
-// Read access token from local security file
 static int read_access_token(const char *filename, char *token, size_t token_size) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -134,14 +124,9 @@ static int read_access_token(const char *filename, char *token, size_t token_siz
     }
     fclose(fp);
     token[strcspn(token, "\r\n")] = '\0';
-    if (token[0] == '\0') {
-        fprintf(stderr, "Error: Token file is empty\n");
-        return 0;
-    }
-    return 1;
+    return (token[0] != '\0');
 }
 
-// Convert 1-based column index to Excel column letters (1 -> A, 2 -> B, 6 -> F, etc.)
 static void get_column_letter(int col_idx, char *out) {
     char temp[16];
     int i = 0;
@@ -150,19 +135,15 @@ static void get_column_letter(int col_idx, char *out) {
         temp[i++] = (char)('A' + rem);
         col_idx = (col_idx - 1) / 26;
     }
-    for (int j = 0; j < i; j++) {
-        out[j] = temp[i - 1 - j];
-    }
+    for (int j = 0; j < i; j++) out[j] = temp[i - 1 - j];
     out[i] = '\0';
 }
 
-// Execute HTTP PUT request to Google Sheets API v4 for a specific range
 static int put_google_sheet_range(const char *token, const char *sheet_name,
                                  const char *range_str, const char *json_payload) {
     CURL *curl = NULL;
     struct curl_slist *headers = NULL;
-    char url[1024];
-    char auth_header[1024];
+    char url[1024], auth_header[1024];
     MemoryBuffer body;
     long http_code = 0;
 
@@ -171,7 +152,6 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
         SPREADSHEET_ID, sheet_name, range_str);
 
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-
     init_memory_buffer(&body);
 
     curl = curl_easy_init();
@@ -207,7 +187,6 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code < 200 || http_code >= 300) {
         fprintf(stderr, "Google Sheets API Error HTTP %ld on tab %s (range %s)\n", http_code, sheet_name, range_str);
-        fprintf(stderr, "Response: %s\n", body.data ? body.data : "(null)");
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         free(body.data);
@@ -223,7 +202,6 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
-        fprintf(stderr, "Example: %s kwh_so 2022\n", argv[0]);
         return 1;
     }
 
@@ -235,35 +213,28 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int base_year = (strcmp(measure_type, "kwh_so") == 0) ? 2021 : 2024;
+    int is_so = (strcmp(measure_type, "kwh_so") == 0);
+    int base_year = is_so ? 2021 : 2024;
+    const char *energy_table = is_so ? "energy_so" : "energy_cc";
 
     if (target_year < base_year || target_year > 2099) {
-        fprintf(stderr, "Error: Invalid target year %d for %s. Must be >= %d.\n", target_year, measure_type, base_year);
+        fprintf(stderr, "Error: Invalid target year %d. Must be >= %d.\n", target_year, base_year);
         return 1;
     }
 
     setenv("TZ", "Europe/Rome", 1);
     tzset();
 
-    char hourly_tab[16], monthly_tab[16];
-    if (strcmp(measure_type, "kwh_so") == 0) {
-        strcpy(hourly_tab, "h_so");
-        strcpy(monthly_tab, "m_so");
-    } else {
-        strcpy(hourly_tab, "h_cc");
-        strcpy(monthly_tab, "m_cc");
-    }
+    char hourly_tab[16], monthly_tab[16], compare_tab[16];
+    snprintf(hourly_tab, sizeof(hourly_tab), "%s", is_so ? "h_so" : "h_cc");
+    snprintf(monthly_tab, sizeof(monthly_tab), "%s", is_so ? "m_so" : "m_cc");
+    snprintf(compare_tab, sizeof(compare_tab), "%s", is_so ? "d_so" : "d_cc");
 
     char access_token[512];
-    if (!read_access_token(TOKEN_FILE, access_token, sizeof(access_token))) {
-        return 1;
-    }
+    if (!read_access_token(TOKEN_FILE, access_token, sizeof(access_token))) return 1;
 
     MYSQL *conn = mysql_init(NULL);
-    if (!conn) {
-        fprintf(stderr, "mysql init error\n");
-        return 1;
-    }
+    if (!conn) return 1;
 
     if (mysql_real_connect(conn, "localhost", USER, PASSWORD, DB, 0, NULL, 0) == NULL) {
         fprintf(stderr, "mysql connect error: %s\n", mysql_error(conn));
@@ -271,26 +242,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Intervallo temporale per il target_year
     struct tm start_tm = {0}, end_tm = {0};
-    start_tm.tm_year = target_year - 1900;
-    start_tm.tm_mon = 0;
-    start_tm.tm_mday = 1;
-    start_tm.tm_hour = 0;
-    start_tm.tm_min = 0;
-    start_tm.tm_sec = 0;
-    start_tm.tm_isdst = -1;
-
-    end_tm.tm_year = target_year - 1900;
-    end_tm.tm_mon = 11;
-    end_tm.tm_mday = 31;
-    end_tm.tm_hour = 23;
-    end_tm.tm_min = 59;
-    end_tm.tm_sec = 59;
-    end_tm.tm_isdst = -1;
+    start_tm.tm_year = target_year - 1900; start_tm.tm_mon = 0; start_tm.tm_mday = 1; start_tm.tm_isdst = -1;
+    end_tm.tm_year = target_year - 1900; end_tm.tm_mon = 11; end_tm.tm_mday = 31; end_tm.tm_hour = 23; end_tm.tm_min = 59; end_tm.tm_sec = 59; end_tm.tm_isdst = -1;
 
     time_t start_epoch = mktime(&start_tm);
     time_t end_epoch = mktime(&end_tm);
 
+    // -------------------------------------------------------------
+    // 1. ELABORAZIONE TABELLA FISCALE (kwh_so / kwh_cc)
+    // -------------------------------------------------------------
     char query[1024];
     snprintf(query, sizeof(query),
              "SELECT epoch, kwh FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
@@ -304,21 +266,18 @@ int main(int argc, char *argv[]) {
 
     MYSQL_RES *res = mysql_store_result(conn);
     if (!res) {
-        fprintf(stderr, "mysql store result error: %s\n", mysql_error(conn));
         mysql_close(conn);
         return 1;
     }
 
     double hourly_sum[24] = {0.0};
     double hourly_total = 0.0;
-    
     double monthly_sum[12][4] = {{0.0}};
     double monthly_annual_totals[4] = {0.0};
 
     MYSQL_ROW row;
     while ((row = mysql_fetch_row(res))) {
         if (!row[0] || !row[1]) continue;
-
         time_t ep = (time_t)atoll(row[0]);
         double val = atof(row[1]);
 
@@ -327,7 +286,6 @@ int main(int argc, char *argv[]) {
 
         int hour = t->tm_hour;
         int month = t->tm_mon;
-
         int band = get_band_index(t);
 
         if (hour >= 0 && hour < 24) {
@@ -338,21 +296,59 @@ int main(int argc, char *argv[]) {
         if (month >= 0 && month < 12 && band >= 1 && band <= 3) {
             monthly_sum[month][band - 1] += val;
             monthly_sum[month][3] += val;
-            
             monthly_annual_totals[band - 1] += val;
             monthly_annual_totals[3] += val;
         }
     }
-
     mysql_free_result(res);
-    mysql_close(conn);
 
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
-        fprintf(stderr, "Failed to initialize libcurl\n");
-        return 1;
+    // -------------------------------------------------------------
+    // 2. ELABORAZIONE MISURATORE TERZO (energy_so / energy_cc)
+    // -------------------------------------------------------------
+    // Query che legge da 7 giorni prima per trovare la lettura iniziale
+    time_t margin_start = start_epoch - (7 * 86400);
+    snprintf(query, sizeof(query),
+             "SELECT epoch, (e1 + e2 + e3) AS total_e FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
+             energy_table, (long)margin_start, (long)end_epoch);
+
+    double energy_monthly_sum[12] = {0.0};
+    double energy_annual_total = 0.0;
+
+    if (mysql_query(conn, query) == 0) {
+        MYSQL_RES *res_e = mysql_store_result(conn);
+        if (res_e) {
+            double prev_val = -1.0;
+            while ((row = mysql_fetch_row(res_e))) {
+                if (!row[0] || !row[1]) continue;
+                time_t ep = (time_t)atoll(row[0]);
+                double curr_val = atof(row[1]);
+
+                if (prev_val >= 0.0) {
+                    double delta = curr_val - prev_val;
+                    // Filtro per evitare valori negativi (reset contatore) o anomali
+                    if (delta > 0.0 && ep >= start_epoch && ep <= end_epoch) {
+                        struct tm *t = localtime(&ep);
+                        if (t && t->tm_mon >= 0 && t->tm_mon < 12) {
+                            energy_monthly_sum[t->tm_mon] += delta;
+                            energy_annual_total += delta;
+                        }
+                    }
+                }
+                prev_val = curr_val;
+            }
+            mysql_free_result(res_e);
+        }
+    } else {
+        fprintf(stderr, "Warning: unable to query %s: %s\n", energy_table, mysql_error(conn));
     }
 
-    // 1. UPDATE HOURLY TAB
+    mysql_close(conn);
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) return 1;
+
+    // -------------------------------------------------------------
+    // Google Sheets Update: 1. HOURLY TAB (h_so / h_cc)
+    // -------------------------------------------------------------
     int hourly_col_idx = 2 + (target_year - base_year);
     char hourly_col_letter[16];
     get_column_letter(hourly_col_idx, hourly_col_letter);
@@ -363,9 +359,7 @@ int main(int argc, char *argv[]) {
     char *json_h = (char *)malloc(16384);
     if (json_h) {
         int off = snprintf(json_h, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", hourly_tab, hourly_range);
-        for (int h = 0; h < 24; h++) {
-            off += snprintf(json_h + off, 16384 - off, "[%.5f],", hourly_sum[h]);
-        }
+        for (int h = 0; h < 24; h++) off += snprintf(json_h + off, 16384 - off, "[%.5f],", hourly_sum[h]);
         snprintf(json_h + off, 16384 - off, "[%.5f]]}", hourly_total);
 
         if (put_google_sheet_range(access_token, hourly_tab, hourly_range, json_h)) {
@@ -374,7 +368,9 @@ int main(int argc, char *argv[]) {
         free(json_h);
     }
 
-    // 2. UPDATE MONTHLY TAB
+    // -------------------------------------------------------------
+    // Google Sheets Update: 2. MONTHLY TAB (m_so / m_cc)
+    // -------------------------------------------------------------
     int start_m_col = 2 + (target_year - base_year) * 4;
     int end_m_col = start_m_col + 3;
 
@@ -401,6 +397,36 @@ int main(int argc, char *argv[]) {
             printf("Updated '%s' range %s for year %d\n", monthly_tab, monthly_range, target_year);
         }
         free(json_m);
+    }
+
+    // -------------------------------------------------------------
+    // Google Sheets Update: 3. COMPARISON TAB (d_so / d_cc)
+    // -------------------------------------------------------------
+    // Ogni anno occupa 2 colonne: Col 1 = kwh_*, Col 2 = energy_*
+    int start_d_col = 2 + (target_year - base_year) * 2;
+    int end_d_col = start_d_col + 1;
+
+    char start_d_letter[16], end_d_letter[16];
+    get_column_letter(start_d_col, start_d_letter);
+    get_column_letter(end_d_col, end_d_letter);
+
+    char compare_range[64];
+    snprintf(compare_range, sizeof(compare_range), "%s2:%s14", start_d_letter, end_d_letter);
+
+    char *json_d = (char *)malloc(16384);
+    if (json_d) {
+        int off = snprintf(json_d, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", compare_tab, compare_range);
+        for (int m = 0; m < 12; m++) {
+            off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f],",
+                            monthly_sum[m][3], energy_monthly_sum[m]);
+        }
+        snprintf(json_d + off, 16384 - off, "[%.5f,%.5f]]}",
+                 monthly_annual_totals[3], energy_annual_total);
+
+        if (put_google_sheet_range(access_token, compare_tab, compare_range, json_d)) {
+            printf("Updated '%s' range %s for year %d\n", compare_tab, compare_range, target_year);
+        }
+        free(json_d);
     }
 
     curl_global_cleanup();

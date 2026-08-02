@@ -199,6 +199,19 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
     return 1;
 }
 
+// Genera l'epoch del 1° giorno del mese (mon da 0 a 12, dove 12 = 1° Gen dell'anno successivo)
+static time_t get_month_boundary_epoch(int year, int mon) {
+    struct tm tm_target = {0};
+    tm_target.tm_year = year - 1900 + (mon / 12);
+    tm_target.tm_mon = mon % 12;
+    tm_target.tm_mday = 1;
+    tm_target.tm_hour = 0;
+    tm_target.tm_min = 0;
+    tm_target.tm_sec = 0;
+    tm_target.tm_isdst = -1;
+    return mktime(&tm_target);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
@@ -214,11 +227,12 @@ int main(int argc, char *argv[]) {
     }
 
     int is_so = (strcmp(measure_type, "kwh_so") == 0);
-    int base_year = is_so ? 2021 : 2024;
+    int base_year_h_m = is_so ? 2021 : 2024;
+    int base_year_d = 2025; // Sia d_so che d_cc partono dal 2025 nelle colonne B e C
     const char *energy_table = is_so ? "energy_so" : "energy_cc";
 
-    if (target_year < base_year || target_year > 2099) {
-        fprintf(stderr, "Error: Invalid target year %d. Must be >= %d.\n", target_year, base_year);
+    if (target_year < (is_so ? 2021 : 2024) || target_year > 2099) {
+        fprintf(stderr, "Error: Invalid target year %d.\n", target_year);
         return 1;
     }
 
@@ -304,42 +318,41 @@ int main(int argc, char *argv[]) {
 
     // -------------------------------------------------------------
     // 2. ELABORAZIONE MISURATORE TERZO (energy_so / energy_cc)
+    //    Cerca l'epoch più vicino al 1° di ogni mese (13 confini in totale)
     // -------------------------------------------------------------
-    // Query che legge da 7 giorni prima per trovare la lettura iniziale
-    time_t margin_start = start_epoch - (7 * 86400);
-    snprintf(query, sizeof(query),
-             "SELECT epoch, (e1 + e2 + e3) AS total_e FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-             energy_table, (long)margin_start, (long)end_epoch);
+    double E_boundary[13] = {0.0};
+    int E_found[13] = {0};
+
+    for (int i = 0; i <= 12; i++) {
+        time_t t_b = get_month_boundary_epoch(target_year, i);
+        snprintf(query, sizeof(query),
+                 "SELECT (e1 + e2 + e3) FROM %s ORDER BY ABS(CAST(epoch AS SIGNED) - %ld) ASC LIMIT 1",
+                 energy_table, (long)t_b);
+
+        if (mysql_query(conn, query) == 0) {
+            MYSQL_RES *res_e = mysql_store_result(conn);
+            if (res_e) {
+                MYSQL_ROW row_e = mysql_fetch_row(res_e);
+                if (row_e && row_e[0]) {
+                    E_boundary[i] = atof(row_e[0]);
+                    E_found[i] = 1;
+                }
+                mysql_free_result(res_e);
+            }
+        }
+    }
 
     double energy_monthly_sum[12] = {0.0};
     double energy_annual_total = 0.0;
 
-    if (mysql_query(conn, query) == 0) {
-        MYSQL_RES *res_e = mysql_store_result(conn);
-        if (res_e) {
-            double prev_val = -1.0;
-            while ((row = mysql_fetch_row(res_e))) {
-                if (!row[0] || !row[1]) continue;
-                time_t ep = (time_t)atoll(row[0]);
-                double curr_val = atof(row[1]);
-
-                if (prev_val >= 0.0) {
-                    double delta = curr_val - prev_val;
-                    // Filtro per evitare valori negativi (reset contatore) o anomali
-                    if (delta > 0.0 && ep >= start_epoch && ep <= end_epoch) {
-                        struct tm *t = localtime(&ep);
-                        if (t && t->tm_mon >= 0 && t->tm_mon < 12) {
-                            energy_monthly_sum[t->tm_mon] += delta;
-                            energy_annual_total += delta;
-                        }
-                    }
-                }
-                prev_val = curr_val;
+    for (int m = 0; m < 12; m++) {
+        if (E_found[m] && E_found[m + 1]) {
+            double diff = E_boundary[m + 1] - E_boundary[m];
+            if (diff > 0.0) {
+                energy_monthly_sum[m] = diff;
+                energy_annual_total += diff;
             }
-            mysql_free_result(res_e);
         }
-    } else {
-        fprintf(stderr, "Warning: unable to query %s: %s\n", energy_table, mysql_error(conn));
     }
 
     mysql_close(conn);
@@ -349,7 +362,7 @@ int main(int argc, char *argv[]) {
     // -------------------------------------------------------------
     // Google Sheets Update: 1. HOURLY TAB (h_so / h_cc)
     // -------------------------------------------------------------
-    int hourly_col_idx = 2 + (target_year - base_year);
+    int hourly_col_idx = 2 + (target_year - base_year_h_m);
     char hourly_col_letter[16];
     get_column_letter(hourly_col_idx, hourly_col_letter);
 
@@ -371,7 +384,7 @@ int main(int argc, char *argv[]) {
     // -------------------------------------------------------------
     // Google Sheets Update: 2. MONTHLY TAB (m_so / m_cc)
     // -------------------------------------------------------------
-    int start_m_col = 2 + (target_year - base_year) * 4;
+    int start_m_col = 2 + (target_year - base_year_h_m) * 4;
     int end_m_col = start_m_col + 3;
 
     char start_m_letter[16], end_m_letter[16];
@@ -401,32 +414,34 @@ int main(int argc, char *argv[]) {
 
     // -------------------------------------------------------------
     // Google Sheets Update: 3. COMPARISON TAB (d_so / d_cc)
+    // Partenza fissa 2025: 2025 -> B,C | 2026 -> D,E | ...
     // -------------------------------------------------------------
-    // Ogni anno occupa 2 colonne: Col 1 = kwh_*, Col 2 = energy_*
-    int start_d_col = 2 + (target_year - base_year) * 2;
-    int end_d_col = start_d_col + 1;
+    if (target_year >= base_year_d) {
+        int start_d_col = 2 + (target_year - base_year_d) * 2;
+        int end_d_col = start_d_col + 1;
 
-    char start_d_letter[16], end_d_letter[16];
-    get_column_letter(start_d_col, start_d_letter);
-    get_column_letter(end_d_col, end_d_letter);
+        char start_d_letter[16], end_d_letter[16];
+        get_column_letter(start_d_col, start_d_letter);
+        get_column_letter(end_d_col, end_d_letter);
 
-    char compare_range[64];
-    snprintf(compare_range, sizeof(compare_range), "%s2:%s14", start_d_letter, end_d_letter);
+        char compare_range[64];
+        snprintf(compare_range, sizeof(compare_range), "%s2:%s14", start_d_letter, end_d_letter);
 
-    char *json_d = (char *)malloc(16384);
-    if (json_d) {
-        int off = snprintf(json_d, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", compare_tab, compare_range);
-        for (int m = 0; m < 12; m++) {
-            off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f],",
-                            monthly_sum[m][3], energy_monthly_sum[m]);
+        char *json_d = (char *)malloc(16384);
+        if (json_d) {
+            int off = snprintf(json_d, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", compare_tab, compare_range);
+            for (int m = 0; m < 12; m++) {
+                off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f],",
+                                monthly_sum[m][3], energy_monthly_sum[m]);
+            }
+            snprintf(json_d + off, 16384 - off, "[%.5f,%.5f]]}",
+                     monthly_annual_totals[3], energy_annual_total);
+
+            if (put_google_sheet_range(access_token, compare_tab, compare_range, json_d)) {
+                printf("Updated '%s' range %s for year %d\n", compare_tab, compare_range, target_year);
+            }
+            free(json_d);
         }
-        snprintf(json_d + off, 16384 - off, "[%.5f,%.5f]]}",
-                 monthly_annual_totals[3], energy_annual_total);
-
-        if (put_google_sheet_range(access_token, compare_tab, compare_range, json_d)) {
-            printf("Updated '%s' range %s for year %d\n", compare_tab, compare_range, target_year);
-        }
-        free(json_d);
     }
 
     curl_global_cleanup();

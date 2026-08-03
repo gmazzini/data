@@ -289,7 +289,7 @@ int main(int argc, char *argv[]) {
   double monthly_cp[12], monthly_cF[12], daily_cp[32], daily_cF[32];
 
   // Time variables
-  time_t start_epoch, end_epoch, ep, t_b, m_start, m_end;
+  time_t start_epoch, end_epoch, ep, prev_ep, t_b, m_start, m_end;
   struct tm start_tm, end_tm, local_tm, *t_ptr;
 
   // Table strings, tokens, query buffers and Google Sheets JSON formatting
@@ -332,7 +332,7 @@ int main(int argc, char *argv[]) {
   memset(daily_cp, 0, sizeof(daily_cp));
   memset(daily_cF, 0, sizeof(daily_cF));
 
-  start_epoch = 0; end_epoch = 0; ep = 0; t_b = 0; m_start = 0; m_end = 0;
+  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0; m_start = 0; m_end = 0;
   memset(&start_tm, 0, sizeof(struct tm));
   memset(&end_tm, 0, sizeof(struct tm));
   memset(&local_tm, 0, sizeof(struct tm));
@@ -530,10 +530,12 @@ int main(int argc, char *argv[]) {
     memset(daily_cp, 0, sizeof(daily_cp));
     memset(daily_cF, 0, sizeof(daily_cF));
     prev_e_tot = -1.0;
+    prev_ep = 0;
 
+    // Join rounded 15-minute epoch blocks
     snprintf(query, sizeof(query),
              "SELECT e.epoch, (e.e1 + e.e2 + e.e3) AS e_tot, p.c "
-             "FROM %s e JOIN pun_15m p ON e.epoch = p.epoch "
+             "FROM %s e JOIN pun_15m p ON (FLOOR(e.epoch / 900) * 900) = (FLOOR(p.epoch / 900) * 900) "
              "WHERE e.epoch BETWEEN %ld AND %ld ORDER BY e.epoch ASC",
              energy_table, (long)m_start, (long)m_end);
 
@@ -549,26 +551,31 @@ int main(int argc, char *argv[]) {
           cur_e_tot = atof(row_j[1]);
           c_val = atof(row_j[2]);
 
-          if (prev_e_tot >= 0.0) {
-            delta_e = cur_e_tot - prev_e_tot;
-            if (delta_e > 0.0) {
-              localtime_r(&ep, &local_tm);
-              day = local_tm.tm_mday;
-              band = get_band_index(&local_tm);
+          if (prev_e_tot >= 0.0 && prev_ep > 0) {
+            // Process interval only if gap is around 15 mins (max 20 mins / 1200 sec)
+            if ((ep - prev_ep) >= 60 && (ep - prev_ep) <= 1200) {
+              delta_e = cur_e_tot - prev_e_tot;
+              if (delta_e > 0.0 && delta_e < 100.0) {
+                localtime_r(&ep, &local_tm);
+                day = local_tm.tm_mday;
+                band = get_band_index(&local_tm);
 
-              cost_p = delta_e * c_val;
-              cost_f = delta_e * F_monthly[m][band];
+                // Convert €/MWh to €/kWh by dividing PUN price by 1000.0
+                cost_p = delta_e * (c_val / 1000.0);
+                cost_f = delta_e * (F_monthly[m][band] / 1000.0);
 
-              if (day >= 1 && day <= 31) {
-                daily_cp[day] += cost_p;
-                daily_cF[day] += cost_f;
+                if (day >= 1 && day <= 31) {
+                  daily_cp[day] += cost_p;
+                  daily_cF[day] += cost_f;
+                }
+
+                monthly_cp[m] += cost_p;
+                monthly_cF[m] += cost_f;
               }
-
-              monthly_cp[m] += cost_p;
-              monthly_cF[m] += cost_f;
             }
           }
           prev_e_tot = cur_e_tot;
+          prev_ep = ep;
         }
         mysql_free_result(res_joined);
       }

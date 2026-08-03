@@ -7,27 +7,23 @@
 #include <curl/curl.h>
 #include <mysql/mysql.h>
 
-// Include local energy setup configuration (provides USER, PASSWORD, DB)
+// Energy setup configuration providing USER, PASSWORD, DB
 #include "/home/tools/setup_energy.c"
 
-// Target configuration definitions
+// Target file locations and IDs
 #define TOKEN_FILE "/home/www/data/google_access_token"
 #define SPREADSHEET_ID "1fw-Nq7RPMs9JF4bb62LGrXuqg81v1bPJjupOmGsCCqg"
 
-// Buffer structure for HTTP response body
+// Memory buffer structure for HTTP payload
 typedef struct {
   char *data;
   size_t size;
 } MemoryBuffer;
 
-// Calculate Easter Monday date for a given year using Anonymous Gauss algorithm
+// Calculate Easter Monday date using Anonymous Gauss algorithm
 static void get_easter_monday(int year, int *out_m, int *out_d) {
   int a, b, c, d, e, f, g, h, i, k, l, m;
   int month_e, day_e;
-
-  a = 0; b = 0; c = 0; d = 0; e = 0; f = 0;
-  g = 0; h = 0; i = 0; k = 0; l = 0; m = 0;
-  month_e = 0; day_e = 0;
 
   a = year % 19;
   b = year / 100;
@@ -58,16 +54,15 @@ static void get_easter_monday(int year, int *out_m, int *out_d) {
   }
 }
 
-// Check if a date is an Italian national holiday
+// Check if a given date is an Italian national holiday
 static int is_festivo(const struct tm *tm) {
   int m, d, y, em_m, em_d;
-
-  m = 0; d = 0; y = 0;
-  em_m = 0; em_d = 0;
 
   m = tm->tm_mon + 1;
   d = tm->tm_mday;
   y = tm->tm_year + 1900;
+  em_m = 0;
+  em_d = 0;
 
   if ((m == 1 && d == 1) || (m == 1 && d == 6) ||
       (m == 4 && d == 25) || (m == 5 && d == 1) ||
@@ -88,8 +83,6 @@ static int is_festivo(const struct tm *tm) {
 // Determine ARERA tariff band index (1 = F1, 2 = F2, 3 = F3)
 static int get_band_index(const struct tm *t) {
   int wday, hour;
-
-  wday = 0; hour = 0;
 
   wday = t->tm_wday;
   hour = t->tm_hour;
@@ -113,6 +106,7 @@ static int get_band_index(const struct tm *t) {
   return 3;
 }
 
+// Initialize memory buffer structure
 static void init_memory_buffer(MemoryBuffer *mem) {
   mem->size = 0;
   mem->data = (char *)malloc(1);
@@ -121,12 +115,11 @@ static void init_memory_buffer(MemoryBuffer *mem) {
   }
 }
 
+// Curl write callback to collect HTTP response body
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
   MemoryBuffer *mem;
   char *ptr;
   size_t realsize;
-
-  mem = NULL; ptr = NULL; realsize = 0;
 
   realsize = size * nmemb;
   mem = (MemoryBuffer *)userp;
@@ -144,10 +137,9 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
   return realsize;
 }
 
+// Read Google API OAuth2 token from file
 static int read_access_token(const char *filename, char *token, size_t token_size) {
   FILE *fp;
-
-  fp = NULL;
 
   fp = fopen(filename, "r");
   if (fp == NULL) {
@@ -172,18 +164,20 @@ static int read_access_token(const char *filename, char *token, size_t token_siz
   return 1;
 }
 
+// Convert 1-based column index to A1 spreadsheet column letters
 static void get_column_letter(int col_idx, char *out) {
   char temp[16];
   int i, j, rem;
 
-  i = 0; j = 0; rem = 0;
+  i = 0;
+  j = 0;
+  rem = 0;
   memset(temp, 0, sizeof(temp));
 
-  for (; col_idx > 0; ) {
+  for (; col_idx > 0; col_idx = (col_idx - 1) / 26) {
     rem = (col_idx - 1) % 26;
     temp[i] = (char)('A' + rem);
     i++;
-    col_idx = (col_idx - 1) / 26;
   }
 
   for (j = 0; j < i; j++) {
@@ -192,6 +186,7 @@ static void get_column_letter(int col_idx, char *out) {
   out[i] = '\0';
 }
 
+// Execute HTTP PUT request to update range in Google Sheets API
 static int put_google_sheet_range(const char *token, const char *sheet_name,
                                  const char *range_str, const char *json_payload) {
   CURL *curl;
@@ -201,9 +196,11 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
   long http_code;
   char url[1024], auth_header[1024];
 
-  curl = NULL; headers = NULL;
-  body.data = NULL; body.size = 0;
-  res = CURLE_OK; http_code = 0;
+  curl = NULL;
+  headers = NULL;
+  body.data = NULL;
+  body.size = 0;
+  http_code = 0;
 
   snprintf(url, sizeof(url),
       "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!%s?valueInputOption=USER_ENTERED",
@@ -257,7 +254,7 @@ static int put_google_sheet_range(const char *token, const char *sheet_name,
   return 1;
 }
 
-// Generate epoch for the 1st day of the month
+// Compute epoch timestamp for 1st day of month
 static time_t get_month_boundary_epoch(int year, int mon) {
   struct tm tm_target;
 
@@ -274,18 +271,28 @@ static time_t get_month_boundary_epoch(int year, int mon) {
 }
 
 int main(int argc, char *argv[]) {
-  MYSQL *conn;
-  MYSQL_RES *res, *res_e;
-  MYSQL_ROW row, row_e;
-  struct tm start_tm, end_tm, *t_ptr;
-  time_t start_epoch, end_epoch, ep, t_b;
+  // Loop counters and index variables
+  int i, m, h, d, b, off;
+  int hour, month, band, day;
+
+  // Configurations and table offsets
+  int target_year, is_so, base_year_h_m, base_year_d;
+  int hourly_col_idx, start_m_col, end_m_col, start_d_col, end_d_col;
+  int E_found[13], monthly_sup[12], total_sup;
+
+  // Energy computations and cost aggregations
+  double val, diff, c_val, delta_e, prev_e_tot, cur_e_tot, cost_p, cost_f;
+  double hourly_total, energy_annual_total, total_cp, total_cF;
   double hourly_sum[24], monthly_sum[12][4], monthly_annual_totals[4];
   double E_boundary[13], energy_monthly_sum[12];
-  double hourly_total, energy_annual_total, val, diff;
-  int E_found[13];
-  int target_year, is_so, base_year_h_m, base_year_d;
-  int hour, month, band, i, m, h, off;
-  int hourly_col_idx, start_m_col, end_m_col, start_d_col, end_d_col;
+  double pun_sums[12][4], pun_counts[12][4], F_monthly[12][4];
+  double monthly_cp[12], monthly_cF[12], daily_cp[32], daily_cF[32];
+
+  // Time variables
+  time_t start_epoch, end_epoch, ep, t_b, m_start, m_end;
+  struct tm start_tm, end_tm, local_tm, *t_ptr;
+
+  // Table strings, tokens, query buffers and Google Sheets JSON formatting
   const char *measure_type, *energy_table;
   char hourly_tab[16], monthly_tab[16], compare_tab[16];
   char access_token[512], query[1024];
@@ -294,24 +301,48 @@ int main(int argc, char *argv[]) {
   char start_d_letter[16], end_d_letter[16], compare_range[64];
   char *json_h, *json_m, *json_d;
 
-  conn = NULL; res = NULL; res_e = NULL; row = NULL; row_e = NULL;
-  t_ptr = NULL;
-  start_epoch = 0; end_epoch = 0; ep = 0; t_b = 0;
-  hourly_total = 0.0; energy_annual_total = 0.0; val = 0.0; diff = 0.0;
-  target_year = 0; is_so = 0; base_year_h_m = 0; base_year_d = 2025;
-  hour = 0; month = 0; band = 0; i = 0; m = 0; h = 0; off = 0;
-  hourly_col_idx = 0; start_m_col = 0; end_m_col = 0; start_d_col = 0; end_d_col = 0;
-  measure_type = NULL; energy_table = NULL;
-  json_h = NULL; json_m = NULL; json_d = NULL;
+  // MySQL database handles
+  MYSQL *conn;
+  MYSQL_RES *res, *res_e, *res_pun, *res_joined;
+  MYSQL_ROW row, row_e, row_pun, row_j;
 
-  memset(&start_tm, 0, sizeof(struct tm));
-  memset(&end_tm, 0, sizeof(struct tm));
+  // Variable initializations
+  i = 0; m = 0; h = 0; d = 0; b = 0; off = 0;
+  hour = 0; month = 0; band = 0; day = 0;
+  target_year = 0; is_so = 0; base_year_h_m = 0; base_year_d = 2025;
+  hourly_col_idx = 0; start_m_col = 0; end_m_col = 0; start_d_col = 0; end_d_col = 0;
+  total_sup = 0;
+
+  val = 0.0; diff = 0.0; c_val = 0.0; delta_e = 0.0; prev_e_tot = -1.0; cur_e_tot = 0.0;
+  cost_p = 0.0; cost_f = 0.0; hourly_total = 0.0; energy_annual_total = 0.0;
+  total_cp = 0.0; total_cF = 0.0;
+
+  memset(E_found, 0, sizeof(E_found));
+  memset(monthly_sup, 0, sizeof(monthly_sup));
   memset(hourly_sum, 0, sizeof(hourly_sum));
   memset(monthly_sum, 0, sizeof(monthly_sum));
   memset(monthly_annual_totals, 0, sizeof(monthly_annual_totals));
   memset(E_boundary, 0, sizeof(E_boundary));
   memset(energy_monthly_sum, 0, sizeof(energy_monthly_sum));
-  memset(E_found, 0, sizeof(E_found));
+  memset(pun_sums, 0, sizeof(pun_sums));
+  memset(pun_counts, 0, sizeof(pun_counts));
+  memset(F_monthly, 0, sizeof(F_monthly));
+  memset(monthly_cp, 0, sizeof(monthly_cp));
+  memset(monthly_cF, 0, sizeof(monthly_cF));
+  memset(daily_cp, 0, sizeof(daily_cp));
+  memset(daily_cF, 0, sizeof(daily_cF));
+
+  start_epoch = 0; end_epoch = 0; ep = 0; t_b = 0; m_start = 0; m_end = 0;
+  memset(&start_tm, 0, sizeof(struct tm));
+  memset(&end_tm, 0, sizeof(struct tm));
+  memset(&local_tm, 0, sizeof(struct tm));
+  t_ptr = NULL;
+
+  measure_type = NULL; energy_table = NULL;
+  json_h = NULL; json_m = NULL; json_d = NULL;
+
+  conn = NULL; res = NULL; res_e = NULL; res_pun = NULL; res_joined = NULL;
+  row = NULL; row_e = NULL; row_pun = NULL; row_j = NULL;
 
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
@@ -357,10 +388,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Time interval for target_year
   start_tm.tm_year = target_year - 1900;
   start_tm.tm_mon = 0;
   start_tm.tm_mday = 1;
+  start_tm.tm_hour = 0;
+  start_tm.tm_min = 0;
+  start_tm.tm_sec = 0;
   start_tm.tm_isdst = -1;
 
   end_tm.tm_year = target_year - 1900;
@@ -374,7 +407,7 @@ int main(int argc, char *argv[]) {
   start_epoch = mktime(&start_tm);
   end_epoch = mktime(&end_tm);
 
-  // 1. Fiscal Table Processing
+  // 1. Fiscal table processing (kwh_so / kwh_cc)
   snprintf(query, sizeof(query),
            "SELECT epoch, kwh FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
            measure_type, (long)start_epoch, (long)end_epoch);
@@ -422,7 +455,7 @@ int main(int argc, char *argv[]) {
   }
   mysql_free_result(res);
 
-  // 2. Third-party Meter Processing
+  // 2. Third-party meter monthly boundaries (energy_so / energy_cc)
   for (i = 0; i <= 12; i++) {
     t_b = get_month_boundary_epoch(target_year, i);
     snprintf(query, sizeof(query),
@@ -450,6 +483,107 @@ int main(int argc, char *argv[]) {
         energy_annual_total += diff;
       }
     }
+  }
+
+  // 3. Compute monthly PUN averages F1, F2, F3
+  snprintf(query, sizeof(query),
+           "SELECT epoch, c FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
+           (long)start_epoch, (long)end_epoch);
+
+  if (mysql_query(conn, query) == 0) {
+    res_pun = mysql_store_result(conn);
+    if (res_pun != NULL) {
+      for (row_pun = mysql_fetch_row(res_pun); row_pun != NULL; row_pun = mysql_fetch_row(res_pun)) {
+        if (row_pun[0] == NULL || row_pun[1] == NULL) {
+          continue;
+        }
+
+        ep = (time_t)atoll(row_pun[0]);
+        c_val = atof(row_pun[1]);
+
+        localtime_r(&ep, &local_tm);
+        m = local_tm.tm_mon;
+        band = get_band_index(&local_tm);
+
+        if (m >= 0 && m < 12 && band >= 1 && band <= 3) {
+          pun_sums[m][band] += c_val;
+          pun_counts[m][band] += 1.0;
+        }
+      }
+      mysql_free_result(res_pun);
+    }
+  }
+
+  for (m = 0; m < 12; m++) {
+    for (b = 1; b <= 3; b++) {
+      if (pun_counts[m][b] > 0.0) {
+        F_monthly[m][b] = pun_sums[m][b] / pun_counts[m][b];
+      }
+    }
+  }
+
+  // 4. Compute cp, cF, sup per month using 15-minute energy_* data
+  for (m = 0; m < 12; m++) {
+    m_start = get_month_boundary_epoch(target_year, m);
+    m_end = get_month_boundary_epoch(target_year, m + 1) - 1;
+
+    memset(daily_cp, 0, sizeof(daily_cp));
+    memset(daily_cF, 0, sizeof(daily_cF));
+    prev_e_tot = -1.0;
+
+    snprintf(query, sizeof(query),
+             "SELECT e.epoch, (e.e1 + e.e2 + e.e3) AS e_tot, p.c "
+             "FROM %s e JOIN pun_15m p ON e.epoch = p.epoch "
+             "WHERE e.epoch BETWEEN %ld AND %ld ORDER BY e.epoch ASC",
+             energy_table, (long)m_start, (long)m_end);
+
+    if (mysql_query(conn, query) == 0) {
+      res_joined = mysql_store_result(conn);
+      if (res_joined != NULL) {
+        for (row_j = mysql_fetch_row(res_joined); row_j != NULL; row_j = mysql_fetch_row(res_joined)) {
+          if (row_j[0] == NULL || row_j[1] == NULL || row_j[2] == NULL) {
+            continue;
+          }
+
+          ep = (time_t)atoll(row_j[0]);
+          cur_e_tot = atof(row_j[1]);
+          c_val = atof(row_j[2]);
+
+          if (prev_e_tot >= 0.0) {
+            delta_e = cur_e_tot - prev_e_tot;
+            if (delta_e > 0.0) {
+              localtime_r(&ep, &local_tm);
+              day = local_tm.tm_mday;
+              band = get_band_index(&local_tm);
+
+              cost_p = delta_e * c_val;
+              cost_f = delta_e * F_monthly[m][band];
+
+              if (day >= 1 && day <= 31) {
+                daily_cp[day] += cost_p;
+                daily_cF[day] += cost_f;
+              }
+
+              monthly_cp[m] += cost_p;
+              monthly_cF[m] += cost_f;
+            }
+          }
+          prev_e_tot = cur_e_tot;
+        }
+        mysql_free_result(res_joined);
+      }
+    }
+
+    // Count unfavorable days (sup)
+    for (d = 1; d <= 31; d++) {
+      if (daily_cp[d] > 0.0 && daily_cp[d] > daily_cF[d]) {
+        monthly_sup[m]++;
+      }
+    }
+
+    total_cp += monthly_cp[m];
+    total_cF += monthly_cF[m];
+    total_sup += monthly_sup[m];
   }
 
   mysql_close(conn);
@@ -505,10 +639,10 @@ int main(int argc, char *argv[]) {
     free(json_m);
   }
 
-  // Google Sheets Update: 3. COMPARISON TAB
+  // Google Sheets Update: 3. COMPARISON TAB (d_so / d_cc)
   if (target_year >= base_year_d) {
-    start_d_col = 2 + (target_year - base_year_d) * 2;
-    end_d_col = start_d_col + 1;
+    start_d_col = 2 + (target_year - base_year_d) * 5;
+    end_d_col = start_d_col + 4;
 
     get_column_letter(start_d_col, start_d_letter);
     get_column_letter(end_d_col, end_d_letter);
@@ -519,11 +653,13 @@ int main(int argc, char *argv[]) {
     if (json_d != NULL) {
       off = snprintf(json_d, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", compare_tab, compare_range);
       for (m = 0; m < 12; m++) {
-        off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f],",
-                        monthly_sum[m][3], energy_monthly_sum[m]);
+        off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f,%.5f,%.5f,%d],",
+                        monthly_sum[m][3], energy_monthly_sum[m],
+                        monthly_cp[m], monthly_cF[m], monthly_sup[m]);
       }
-      snprintf(json_d + off, 16384 - off, "[%.5f,%.5f]]}",
-               monthly_annual_totals[3], energy_annual_total);
+      snprintf(json_d + off, 16384 - off, "[%.5f,%.5f,%.5f,%.5f,%d]]}",
+               monthly_annual_totals[3], energy_annual_total,
+               total_cp, total_cF, total_sup);
 
       if (put_google_sheet_range(access_token, compare_tab, compare_range, json_d)) {
         printf("Updated '%s' range %s for year %d\n", compare_tab, compare_range, target_year);

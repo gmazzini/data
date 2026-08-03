@@ -14,6 +14,9 @@
 #define TOKEN_FILE "/home/www/data/google_access_token"
 #define SPREADSHEET_ID "1fw-Nq7RPMs9JF4bb62LGrXuqg81v1bPJjupOmGsCCqg"
 
+// Max 15-min intervals in a leap year: 366 * 96 = 35136
+#define MAX_PUN_SLOTS 36000
+
 // Memory buffer structure for HTTP payload
 typedef struct {
   char *data;
@@ -272,7 +275,7 @@ static time_t get_month_boundary_epoch(int year, int mon) {
 
 int main(int argc, char *argv[]) {
   // Loop counters and index variables
-  int i, m, h, d, b, off;
+  int i, m, h, d, b, off, slot;
   int hour, month, band, day;
 
   // Configurations and table offsets
@@ -288,8 +291,11 @@ int main(int argc, char *argv[]) {
   double pun_sums[12][4], pun_counts[12][4], F_monthly[12][4];
   double monthly_cp[12], monthly_cF[12], daily_cp[32], daily_cF[32];
 
+  // Fast In-Memory PUN Lookup Array
+  double *pun_lookup;
+
   // Time variables
-  time_t start_epoch, end_epoch, ep, prev_ep, t_b, m_start, m_end;
+  time_t start_epoch, end_epoch, ep, prev_ep, t_b;
   struct tm start_tm, end_tm, local_tm, *t_ptr;
 
   // Table strings, tokens, query buffers and Google Sheets JSON formatting
@@ -303,11 +309,11 @@ int main(int argc, char *argv[]) {
 
   // MySQL database handles
   MYSQL *conn;
-  MYSQL_RES *res, *res_e, *res_pun, *res_joined;
-  MYSQL_ROW row, row_e, row_pun, row_j;
+  MYSQL_RES *res, *res_e, *res_pun, *res_energy;
+  MYSQL_ROW row, row_e, row_pun, row_en;
 
   // Variable initializations
-  i = 0; m = 0; h = 0; d = 0; b = 0; off = 0;
+  i = 0; m = 0; h = 0; d = 0; b = 0; off = 0; slot = 0;
   hour = 0; month = 0; band = 0; day = 0;
   target_year = 0; is_so = 0; base_year_h_m = 0; base_year_d = 2025;
   hourly_col_idx = 0; start_m_col = 0; end_m_col = 0; start_d_col = 0; end_d_col = 0;
@@ -329,10 +335,8 @@ int main(int argc, char *argv[]) {
   memset(F_monthly, 0, sizeof(F_monthly));
   memset(monthly_cp, 0, sizeof(monthly_cp));
   memset(monthly_cF, 0, sizeof(monthly_cF));
-  memset(daily_cp, 0, sizeof(daily_cp));
-  memset(daily_cF, 0, sizeof(daily_cF));
 
-  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0; m_start = 0; m_end = 0;
+  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0;
   memset(&start_tm, 0, sizeof(struct tm));
   memset(&end_tm, 0, sizeof(struct tm));
   memset(&local_tm, 0, sizeof(struct tm));
@@ -341,8 +345,8 @@ int main(int argc, char *argv[]) {
   measure_type = NULL; energy_table = NULL;
   json_h = NULL; json_m = NULL; json_d = NULL;
 
-  conn = NULL; res = NULL; res_e = NULL; res_pun = NULL; res_joined = NULL;
-  row = NULL; row_e = NULL; row_pun = NULL; row_j = NULL;
+  conn = NULL; res = NULL; res_e = NULL; res_pun = NULL; res_energy = NULL;
+  row = NULL; row_e = NULL; row_pun = NULL; row_en = NULL;
 
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
@@ -377,14 +381,23 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Allocate PUN 15-min lookup array in memory
+  pun_lookup = (double *)calloc(MAX_PUN_SLOTS, sizeof(double));
+  if (pun_lookup == NULL) {
+    fprintf(stderr, "Error: Memory allocation failed for PUN lookup table\n");
+    return 1;
+  }
+
   conn = mysql_init(NULL);
   if (conn == NULL) {
+    free(pun_lookup);
     return 1;
   }
 
   if (mysql_real_connect(conn, "localhost", USER, PASSWORD, DB, 0, NULL, 0) == NULL) {
     fprintf(stderr, "mysql connect error: %s\n", mysql_error(conn));
     mysql_close(conn);
+    free(pun_lookup);
     return 1;
   }
 
@@ -415,12 +428,14 @@ int main(int argc, char *argv[]) {
   if (mysql_query(conn, query) != 0) {
     fprintf(stderr, "mysql query error: %s\n", mysql_error(conn));
     mysql_close(conn);
+    free(pun_lookup);
     return 1;
   }
 
   res = mysql_store_result(conn);
   if (res == NULL) {
     mysql_close(conn);
+    free(pun_lookup);
     return 1;
   }
 
@@ -455,11 +470,11 @@ int main(int argc, char *argv[]) {
   }
   mysql_free_result(res);
 
-  // 2. Third-party meter monthly boundaries (energy_so / energy_cc)
+  // 2. Fast search for monthly boundary values
   for (i = 0; i <= 12; i++) {
     t_b = get_month_boundary_epoch(target_year, i);
     snprintf(query, sizeof(query),
-             "SELECT (e1 + e2 + e3) FROM %s ORDER BY ABS(CAST(epoch AS SIGNED) - %ld) ASC LIMIT 1",
+             "SELECT (e1 + e2 + e3) FROM %s WHERE epoch >= %ld ORDER BY epoch ASC LIMIT 1",
              energy_table, (long)t_b);
 
     if (mysql_query(conn, query) == 0) {
@@ -485,7 +500,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // 3. Compute monthly PUN averages F1, F2, F3
+  // 3. Load entire year of PUN prices into RAM array and compute monthly F1/F2/F3 averages
   snprintf(query, sizeof(query),
            "SELECT epoch, c FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
            (long)start_epoch, (long)end_epoch);
@@ -500,6 +515,12 @@ int main(int argc, char *argv[]) {
 
         ep = (time_t)atoll(row_pun[0]);
         c_val = atof(row_pun[1]);
+
+        // Map epoch to array slot in memory
+        slot = (int)((ep - start_epoch) / 900);
+        if (slot >= 0 && slot < MAX_PUN_SLOTS) {
+          pun_lookup[slot] = c_val;
+        }
 
         localtime_r(&ep, &local_tm);
         m = local_tm.tm_mon;
@@ -522,78 +543,81 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // 4. Compute cp, cF, sup per month using 15-minute energy_* data
-  for (m = 0; m < 12; m++) {
-    m_start = get_month_boundary_epoch(target_year, m);
-    m_end = get_month_boundary_epoch(target_year, m + 1) - 1;
+  // 4. Compute cp, cF, sup processing energy meters directly in C
+  snprintf(query, sizeof(query),
+           "SELECT epoch, (e1 + e2 + e3) FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
+           energy_table, (long)start_epoch, (long)end_epoch);
 
-    memset(daily_cp, 0, sizeof(daily_cp));
-    memset(daily_cF, 0, sizeof(daily_cF));
-    prev_e_tot = -1.0;
-    prev_ep = 0;
+  if (mysql_query(conn, query) == 0) {
+    res_energy = mysql_store_result(conn);
+    if (res_energy != NULL) {
+      prev_e_tot = -1.0;
+      prev_ep = 0;
 
-    // Join rounded 15-minute epoch blocks
-    snprintf(query, sizeof(query),
-             "SELECT e.epoch, (e.e1 + e.e2 + e.e3) AS e_tot, p.c "
-             "FROM %s e JOIN pun_15m p ON (FLOOR(e.epoch / 900) * 900) = (FLOOR(p.epoch / 900) * 900) "
-             "WHERE e.epoch BETWEEN %ld AND %ld ORDER BY e.epoch ASC",
-             energy_table, (long)m_start, (long)m_end);
+      memset(daily_cp, 0, sizeof(daily_cp));
+      memset(daily_cF, 0, sizeof(daily_cF));
 
-    if (mysql_query(conn, query) == 0) {
-      res_joined = mysql_store_result(conn);
-      if (res_joined != NULL) {
-        for (row_j = mysql_fetch_row(res_joined); row_j != NULL; row_j = mysql_fetch_row(res_joined)) {
-          if (row_j[0] == NULL || row_j[1] == NULL || row_j[2] == NULL) {
-            continue;
-          }
+      for (row_en = mysql_fetch_row(res_energy); row_en != NULL; row_en = mysql_fetch_row(res_en)) {
+        if (row_en[0] == NULL || row_en[1] == NULL) {
+          continue;
+        }
 
-          ep = (time_t)atoll(row_j[0]);
-          cur_e_tot = atof(row_j[1]);
-          c_val = atof(row_j[2]);
+        ep = (time_t)atoll(row_en[0]);
+        cur_e_tot = atof(row_en[1]);
 
-          if (prev_e_tot >= 0.0 && prev_ep > 0) {
-            // Process interval only if gap is around 15 mins (max 20 mins / 1200 sec)
-            if ((ep - prev_ep) >= 60 && (ep - prev_ep) <= 1200) {
-              delta_e = cur_e_tot - prev_e_tot;
-              if (delta_e > 0.0 && delta_e < 100.0) {
-                localtime_r(&ep, &local_tm);
-                day = local_tm.tm_mday;
-                band = get_band_index(&local_tm);
+        localtime_r(&ep, &local_tm);
+        m = local_tm.tm_mon;
+        day = local_tm.tm_mday;
+        band = get_band_index(&local_tm);
 
-                // Convert €/MWh to €/kWh by dividing PUN price by 1000.0
-                cost_p = delta_e * (c_val / 1000.0);
-                cost_f = delta_e * (F_monthly[m][band] / 1000.0);
+        // Fetch pre-loaded PUN price from memory
+        slot = (int)((ep - start_epoch) / 900);
+        c_val = (slot >= 0 && slot < MAX_PUN_SLOTS) ? pun_lookup[slot] : 0.0;
 
-                if (day >= 1 && day <= 31) {
-                  daily_cp[day] += cost_p;
-                  daily_cF[day] += cost_f;
+        if (prev_e_tot >= 0.0 && prev_ep > 0) {
+          // Check for valid 15-min sampling window (max 20 mins)
+          if ((ep - prev_ep) >= 60 && (ep - prev_ep) <= 1200) {
+            delta_e = cur_e_tot - prev_e_tot;
+            if (delta_e > 0.0 && delta_e < 100.0) {
+
+              // Correct price calculations dividing PUN (€/MWh) by 1000.0 to get €/kWh
+              cost_p = delta_e * (c_val / 1000.0);
+              cost_f = delta_e * (F_monthly[m][band] / 1000.0);
+
+              if (day >= 1 && day <= 31) {
+                daily_cp[day] += cost_p;
+                daily_cF[day] += cost_f;
+              }
+
+              monthly_cp[m] += cost_p;
+              monthly_cF[m] += cost_f;
+
+              // Check if day changed to count unfavorable days (sup)
+              if (local_tm.tm_hour == 23 && local_tm.tm_min >= 45) {
+                if (daily_cp[day] > 0.0 && daily_cp[day] > daily_cF[day]) {
+                  monthly_sup[m]++;
                 }
-
-                monthly_cp[m] += cost_p;
-                monthly_cF[m] += cost_f;
+                daily_cp[day] = 0.0;
+                daily_cF[day] = 0.0;
               }
             }
           }
-          prev_e_tot = cur_e_tot;
-          prev_ep = ep;
         }
-        mysql_free_result(res_joined);
+        prev_e_tot = cur_e_tot;
+        prev_ep = ep;
       }
+      mysql_free_result(res_energy);
     }
+  }
 
-    // Count unfavorable days (sup)
-    for (d = 1; d <= 31; d++) {
-      if (daily_cp[d] > 0.0 && daily_cp[d] > daily_cF[d]) {
-        monthly_sup[m]++;
-      }
-    }
-
+  for (m = 0; m < 12; m++) {
     total_cp += monthly_cp[m];
     total_cF += monthly_cF[m];
     total_sup += monthly_sup[m];
   }
 
   mysql_close(conn);
+  free(pun_lookup);
 
   if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
     return 1;

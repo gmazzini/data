@@ -289,13 +289,13 @@ int main(int argc, char *argv[]) {
   double hourly_sum[24], monthly_sum[12][4], monthly_annual_totals[4];
   double E_boundary[13], energy_monthly_sum[12];
   double pun_sums[12][4], pun_counts[12][4], F_monthly[12][4];
-  double monthly_cp[12], monthly_cF[12], daily_cp[32], daily_cF[32];
+  double monthly_cp[12], monthly_cF[12], daily_cp[12][32], daily_cF[12][32];
 
   // Fast In-Memory PUN Lookup Array
   double *pun_lookup;
 
   // Time variables
-  time_t start_epoch, end_epoch, ep, prev_ep, t_b;
+  time_t start_epoch, end_epoch, ep, prev_ep, t_b, ep_rounded;
   struct tm start_tm, end_tm, local_tm, *t_ptr;
 
   // Table strings, tokens, query buffers and Google Sheets JSON formatting
@@ -335,8 +335,10 @@ int main(int argc, char *argv[]) {
   memset(F_monthly, 0, sizeof(F_monthly));
   memset(monthly_cp, 0, sizeof(monthly_cp));
   memset(monthly_cF, 0, sizeof(monthly_cF));
+  memset(daily_cp, 0, sizeof(daily_cp));
+  memset(daily_cF, 0, sizeof(daily_cF));
 
-  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0;
+  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0; ep_rounded = 0;
   memset(&start_tm, 0, sizeof(struct tm));
   memset(&end_tm, 0, sizeof(struct tm));
   memset(&local_tm, 0, sizeof(struct tm));
@@ -470,12 +472,13 @@ int main(int argc, char *argv[]) {
   }
   mysql_free_result(res);
 
-  // 2. Fast search for monthly boundary values
+  // 2. Fast AND Precise search for monthly boundary values (colonna 2 misure d_*)
   for (i = 0; i <= 12; i++) {
     t_b = get_month_boundary_epoch(target_year, i);
     snprintf(query, sizeof(query),
-             "SELECT (e1 + e2 + e3) FROM %s WHERE epoch >= %ld ORDER BY epoch ASC LIMIT 1",
-             energy_table, (long)t_b);
+             "SELECT (e1 + e2 + e3) FROM %s WHERE epoch BETWEEN %ld AND %ld "
+             "ORDER BY ABS(CAST(epoch AS SIGNED) - %ld) ASC LIMIT 1",
+             energy_table, (long)(t_b - 3600), (long)(t_b + 3600), (long)t_b);
 
     if (mysql_query(conn, query) == 0) {
       res_e = mysql_store_result(conn);
@@ -516,8 +519,9 @@ int main(int argc, char *argv[]) {
         ep = (time_t)atoll(row_pun[0]);
         c_val = atof(row_pun[1]);
 
-        // Map epoch to array slot in memory
-        slot = (int)((ep - start_epoch) / 900);
+        // Round timestamp to nearest 15-minute slot
+        ep_rounded = ep - (ep % 900);
+        slot = (int)((ep_rounded - start_epoch) / 900);
         if (slot >= 0 && slot < MAX_PUN_SLOTS) {
           pun_lookup[slot] = c_val;
         }
@@ -554,10 +558,7 @@ int main(int argc, char *argv[]) {
       prev_e_tot = -1.0;
       prev_ep = 0;
 
-      memset(daily_cp, 0, sizeof(daily_cp));
-      memset(daily_cF, 0, sizeof(daily_cF));
-
-      for (row_en = mysql_fetch_row(res_energy); row_en != NULL; row_en = mysql_fetch_row(res_en)) {
+      for (row_en = mysql_fetch_row(res_energy); row_en != NULL; row_en = mysql_fetch_row(res_energy)) {
         if (row_en[0] == NULL || row_en[1] == NULL) {
           continue;
         }
@@ -570,12 +571,13 @@ int main(int argc, char *argv[]) {
         day = local_tm.tm_mday;
         band = get_band_index(&local_tm);
 
-        // Fetch pre-loaded PUN price from memory
-        slot = (int)((ep - start_epoch) / 900);
+        // Fetch pre-loaded PUN price from memory using rounded timestamp
+        ep_rounded = ep - (ep % 900);
+        slot = (int)((ep_rounded - start_epoch) / 900);
         c_val = (slot >= 0 && slot < MAX_PUN_SLOTS) ? pun_lookup[slot] : 0.0;
 
         if (prev_e_tot >= 0.0 && prev_ep > 0) {
-          // Check for valid 15-min sampling window (max 20 mins)
+          // Check for valid sampling window (between 1 min and 20 mins)
           if ((ep - prev_ep) >= 60 && (ep - prev_ep) <= 1200) {
             delta_e = cur_e_tot - prev_e_tot;
             if (delta_e > 0.0 && delta_e < 100.0) {
@@ -584,21 +586,14 @@ int main(int argc, char *argv[]) {
               cost_p = delta_e * (c_val / 1000.0);
               cost_f = delta_e * (F_monthly[m][band] / 1000.0);
 
-              if (day >= 1 && day <= 31) {
-                daily_cp[day] += cost_p;
-                daily_cF[day] += cost_f;
-              }
+              if (m >= 0 && m < 12) {
+                monthly_cp[m] += cost_p;
+                monthly_cF[m] += cost_f;
 
-              monthly_cp[m] += cost_p;
-              monthly_cF[m] += cost_f;
-
-              // Check if day changed to count unfavorable days (sup)
-              if (local_tm.tm_hour == 23 && local_tm.tm_min >= 45) {
-                if (daily_cp[day] > 0.0 && daily_cp[day] > daily_cF[day]) {
-                  monthly_sup[m]++;
+                if (day >= 1 && day <= 31) {
+                  daily_cp[m][day] += cost_p;
+                  daily_cF[m][day] += cost_f;
                 }
-                daily_cp[day] = 0.0;
-                daily_cF[day] = 0.0;
               }
             }
           }
@@ -610,7 +605,14 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Calculate monthly unfavorable days (sup) and totals
   for (m = 0; m < 12; m++) {
+    monthly_sup[m] = 0;
+    for (d = 1; d <= 31; d++) {
+      if (daily_cp[m][d] > 0.0 && daily_cp[m][d] > daily_cF[m][d]) {
+        monthly_sup[m]++;
+      }
+    }
     total_cp += monthly_cp[m];
     total_cF += monthly_cF[m];
     total_sup += monthly_sup[m];

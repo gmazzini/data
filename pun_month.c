@@ -1,4 +1,4 @@
-// Program to compute monthly PUN band averages and metrics (MIN, MAX, BESTDAY, WORSTDAY, MINDAY)
+// Gianluca Mazzini @2026- Version 1.15 
 // Writes results to Google Sheets from column A to J
 // Accepts input parameter in format YYYYMM (e.g. 202607)
 

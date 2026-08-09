@@ -1,6 +1,6 @@
-// Gianluca Mazzini @2026- Version 1.15 
-// Writes results to Google Sheets from column A to J
-// Accepts input parameter in format YYYYMM (e.g. 202607)
+// Gianluca Mazzini @2026- Version 1.16
+// Writes PUN monthly results and daily 3-hour minimum window to Google Sheets
+// Accepts input parameter in format YYYYMMDD (e.g. 20260715)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,9 +15,14 @@
 // Path to Google OAuth2 token file
 #define TOKEN_FILE "/home/www/data/google_access_token"
 
-// Google Spreadsheet ID and Tab name
+// Google Spreadsheet ID and Tab names
 #define SPREADSHEET_ID "1RF4N-T2NR2UHai70AzTzwuLXowkLlOQWvFyb8AaE1xg"
-#define SHEET_NAME "pun"
+#define SHEET_NAME_PUN "pun"
+#define SHEET_NAME_H "h"
+
+// Max 15-minute intervals in a month and 3-hour window slots
+#define MAX_RECORDS 3500
+#define WINDOW_SLOTS 12
 
 // Structure to store individual 15-minute records
 typedef struct {
@@ -198,11 +203,11 @@ static int get_band_index(struct tm *tm) {
   return 3;
 }
 
-// Update Google Sheet row using Google Sheets API v4 (Columns A to J)
-static int update_google_sheet(const char *token, const char *aaaamm, int row_index,
-                                double f0, double f1, double f2, double f3,
-                                double min_val, double max_val,
-                                const char *bestday, const char *worstday, const char *minday) {
+// Update Google Sheet row for monthly tab "pun" (Columns A to J)
+static int update_google_sheet_pun(const char *token, const char *aaaamm, int row_index,
+                                    double f0, double f1, double f2, double f3,
+                                    double min_val, double max_val,
+                                    const char *bestday, const char *worstday, const char *minday) {
   CURL *curl;
   struct curl_slist *headers;
   struct mem body;
@@ -219,7 +224,7 @@ static int update_google_sheet(const char *token, const char *aaaamm, int row_in
 
   snprintf(url, sizeof(url),
     "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:J%d?valueInputOption=USER_ENTERED",
-    SPREADSHEET_ID, SHEET_NAME, row_index, row_index);
+    SPREADSHEET_ID, SHEET_NAME_PUN, row_index, row_index);
 
   snprintf(json_payload, sizeof(json_payload),
     "{"
@@ -229,7 +234,7 @@ static int update_google_sheet(const char *token, const char *aaaamm, int row_in
     "\"%s\",%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,\"%s\",\"%s\",\"%s\""
     "]]"
     "}",
-    SHEET_NAME, row_index, row_index,
+    SHEET_NAME_PUN, row_index, row_index,
     aaaamm, f0, f1, f2, f3, min_val, max_val, bestday, worstday, minday);
 
   snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
@@ -261,7 +266,7 @@ static int update_google_sheet(const char *token, const char *aaaamm, int row_in
 
   res = curl_easy_perform(curl);
   if (res != CURLE_OK) {
-    fprintf(stderr, "Google Sheets API curl error: %s\n", curl_easy_strerror(res));
+    fprintf(stderr, "Google Sheets API (tab pun) curl error: %s\n", curl_easy_strerror(res));
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(body.ptr);
@@ -270,8 +275,91 @@ static int update_google_sheet(const char *token, const char *aaaamm, int row_in
 
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
   if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API HTTP %ld\n", http_code);
-    fprintf(stderr, "Response: %s\n", body.ptr ? body.ptr : "(null)");
+    fprintf(stderr, "Google Sheets API (tab pun) HTTP %ld\n", http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body.ptr);
+    return 0;
+  }
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  free(body.ptr);
+  return 1;
+}
+
+// Update Google Sheet row for daily window tab "h" (Columns A to C)
+static int update_google_sheet_h(const char *token, int row_index,
+                                 const char *date_str, const char *time_str,
+                                 double avg_3h) {
+  CURL *curl;
+  struct curl_slist *headers;
+  struct mem body;
+  CURLcode res;
+  long http_code;
+  char url[512], json_payload[512], auth_header[1024];
+
+  curl = NULL;
+  headers = NULL;
+  body.ptr = NULL;
+  body.len = 0;
+  res = CURLE_OK;
+  http_code = 0;
+
+  snprintf(url, sizeof(url),
+    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:C%d?valueInputOption=USER_ENTERED",
+    SPREADSHEET_ID, SHEET_NAME_H, row_index, row_index);
+
+  snprintf(json_payload, sizeof(json_payload),
+    "{"
+    "\"range\":\"%s!A%d:C%d\","
+    "\"majorDimension\":\"ROWS\","
+    "\"values\":[["
+    "\"%s\",\"%s\",%.5f"
+    "]]"
+    "}",
+    SHEET_NAME_H, row_index, row_index,
+    date_str, time_str, avg_3h);
+
+  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+
+  mem_init(&body);
+
+  curl = curl_easy_init();
+  if (curl == NULL) {
+    free(body.ptr);
+    return 0;
+  }
+
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, auth_header);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+
+  res = curl_easy_perform(curl);
+  if (res != CURLE_OK) {
+    fprintf(stderr, "Google Sheets API (tab h) curl error: %s\n", curl_easy_strerror(res));
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body.ptr);
+    return 0;
+  }
+
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  if (http_code < 200 || http_code >= 300) {
+    fprintf(stderr, "Google Sheets API (tab h) HTTP %ld\n", http_code);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(body.ptr);
@@ -288,28 +376,33 @@ int main(int argc, char *argv[]) {
   MYSQL *conn;
   MYSQL_RES *result;
   MYSQL_ROW row;
-  static Record records[3500];
-  struct tm start_tm, next_tm, local_tm;
-  time_t sds, sde, t_val;
-  double sums[4], day_sums[32];
+  static Record records[MAX_RECORDS];
+  struct tm start_tm, next_tm, local_tm, base_tm, target_tm;
+  time_t sds, sde, t_val, base_epoch, target_epoch, day_epochs[96];
+  double sums[4], day_sums[32], day_prices[96];
   double global_min, global_max, f0, f1, f2, f3;
   double min_day_avg, max_day_avg, avg, c_val;
+  double window_sum, min_window_sum, min_window_avg;
   long counts[4], day_counts[32];
   long long epoch_val;
-  int year, month, delta_months, row_index, total_records;
+  int year, month, day, delta_months, days_diff;
+  int row_index_pun, row_index_h, total_records, day_records_count;
   int best_day, worst_day, min_day, max_consec_run, current_run, max_run;
-  int band, d, i;
+  int band, d, i, k, best_window_idx;
   int max_consecutive_per_day[32];
-  char query[512], access_token[512];
+  char query[512], access_token[512], aaaamm[8];
   char bestday_str[16], worstday_str[16], minday_str[16];
+  char date_str[16], time_str[16];
 
-  // Initialize variables after definition block
+  // Initialize variables after declaration block
   conn = NULL;
   result = NULL;
   row = NULL;
   sds = 0;
   sde = 0;
   t_val = 0;
+  base_epoch = 0;
+  target_epoch = 0;
   global_min = DBL_MAX;
   global_max = -DBL_MAX;
   f0 = 0.0;
@@ -320,12 +413,19 @@ int main(int argc, char *argv[]) {
   max_day_avg = -DBL_MAX;
   avg = 0.0;
   c_val = 0.0;
+  window_sum = 0.0;
+  min_window_sum = DBL_MAX;
+  min_window_avg = 0.0;
   epoch_val = 0;
   year = 0;
   month = 0;
+  day = 0;
   delta_months = 0;
-  row_index = 0;
+  days_diff = 0;
+  row_index_pun = 0;
+  row_index_h = 0;
   total_records = 0;
+  day_records_count = 0;
   best_day = 1;
   worst_day = 1;
   min_day = 1;
@@ -335,37 +435,82 @@ int main(int argc, char *argv[]) {
   band = 0;
   d = 0;
   i = 0;
+  k = 0;
+  best_window_idx = 0;
 
   memset(&start_tm, 0, sizeof(struct tm));
   memset(&next_tm, 0, sizeof(struct tm));
   memset(&local_tm, 0, sizeof(struct tm));
+  memset(&base_tm, 0, sizeof(struct tm));
+  memset(&target_tm, 0, sizeof(struct tm));
   memset(sums, 0, sizeof(sums));
   memset(day_sums, 0, sizeof(day_sums));
+  memset(day_prices, 0, sizeof(day_prices));
+  memset(day_epochs, 0, sizeof(day_epochs));
   memset(counts, 0, sizeof(counts));
   memset(day_counts, 0, sizeof(day_counts));
   memset(max_consecutive_per_day, 0, sizeof(max_consecutive_per_day));
+  memset(query, 0, sizeof(query));
+  memset(access_token, 0, sizeof(access_token));
+  memset(aaaamm, 0, sizeof(aaaamm));
+  memset(bestday_str, 0, sizeof(bestday_str));
+  memset(worstday_str, 0, sizeof(worstday_str));
+  memset(minday_str, 0, sizeof(minday_str));
+  memset(date_str, 0, sizeof(date_str));
+  memset(time_str, 0, sizeof(time_str));
 
   if (argc != 2) {
-    fprintf(stderr, "Usage: %s YYYYMM\n", argv[0]);
-    fprintf(stderr, "Example: %s 202607\n", argv[0]);
+    fprintf(stderr, "Usage: %s YYYYMMDD\n", argv[0]);
+    fprintf(stderr, "Example: %s 20260715\n", argv[0]);
     return 1;
   }
 
-  if (strlen(argv[1]) != 6) {
-    fprintf(stderr, "Error: parameter must be 6 digits (YYYYMM)\n");
+  if (strlen(argv[1]) != 8) {
+    fprintf(stderr, "Error: parameter must be 8 digits (YYYYMMDD)\n");
     return 1;
   }
 
-  if (sscanf(argv[1], "%4d%2d", &year, &month) != 2 || month < 1 || month > 12) {
-    fprintf(stderr, "Error: invalid year or month in %s\n", argv[1]);
+  if (sscanf(argv[1], "%4d%2d%2d", &year, &month, &day) != 3 ||
+      month < 1 || month > 12 || day < 1 || day > 31) {
+    fprintf(stderr, "Error: invalid year, month or day in %s\n", argv[1]);
     return 1;
   }
+
+  snprintf(aaaamm, sizeof(aaaamm), "%04d%02d", year, month);
+  snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d", year, month, day);
 
   delta_months = (year - 2025) * 12 + (month - 10);
-  row_index = 2 + delta_months;
+  row_index_pun = 2 + delta_months;
 
-  if (row_index < 2) {
-    fprintf(stderr, "Error: Date %s is before base date 202510\n", argv[1]);
+  if (row_index_pun < 2) {
+    fprintf(stderr, "Error: Date %s is before base date 20251001\n", argv[1]);
+    return 1;
+  }
+
+  // Calculate row index for tab "h" relative to base date 2025-10-01 (Row 2)
+  base_tm.tm_year = 2025 - 1900;
+  base_tm.tm_mon = 10 - 1;
+  base_tm.tm_mday = 1;
+  base_tm.tm_hour = 12;
+  base_tm.tm_min = 0;
+  base_tm.tm_sec = 0;
+  base_tm.tm_isdst = -1;
+  base_epoch = mktime(&base_tm);
+
+  target_tm.tm_year = year - 1900;
+  target_tm.tm_mon = month - 1;
+  target_tm.tm_mday = day;
+  target_tm.tm_hour = 12;
+  target_tm.tm_min = 0;
+  target_tm.tm_sec = 0;
+  target_tm.tm_isdst = -1;
+  target_epoch = mktime(&target_tm);
+
+  days_diff = (int)floor(difftime(target_epoch, base_epoch) / 86400.0 + 0.5);
+  row_index_h = 2 + days_diff;
+
+  if (row_index_h < 2) {
+    fprintf(stderr, "Error: Date %s is before base date 20251001\n", argv[1]);
     return 1;
   }
 
@@ -442,7 +587,7 @@ int main(int argc, char *argv[]) {
       global_max = c_val;
     }
 
-    if (total_records < 3500) {
+    if (total_records < MAX_RECORDS) {
       records[total_records].epoch = t_val;
       records[total_records].price = c_val;
       records[total_records].day = local_tm.tm_mday;
@@ -529,6 +674,41 @@ int main(int argc, char *argv[]) {
   snprintf(worstday_str, sizeof(worstday_str), "%04d-%02d-%02d", year, month, worst_day);
   snprintf(minday_str, sizeof(minday_str), "%04d-%02d-%02d", year, month, min_day);
 
+  // Extract records for target day to compute 3-hour minimum window
+  day_records_count = 0;
+  for (i = 0; i < total_records; i++) {
+    if (records[i].day == day) {
+      if (day_records_count < 96) {
+        day_prices[day_records_count] = records[i].price;
+        day_epochs[day_records_count] = records[i].epoch;
+        day_records_count++;
+      }
+    }
+  }
+
+  // Calculate sliding window minimum for 3-hour period (12 consecutive 15-min slots)
+  best_window_idx = 0;
+  min_window_sum = DBL_MAX;
+
+  if (day_records_count >= WINDOW_SLOTS) {
+    for (i = 0; i <= day_records_count - WINDOW_SLOTS; i++) {
+      window_sum = 0.0;
+      for (k = 0; k < WINDOW_SLOTS; k++) {
+        window_sum += day_prices[i + k];
+      }
+      if (window_sum < min_window_sum) {
+        min_window_sum = window_sum;
+        best_window_idx = i;
+      }
+    }
+    min_window_avg = min_window_sum / (double)WINDOW_SLOTS;
+    localtime_r(&day_epochs[best_window_idx], &local_tm);
+    snprintf(time_str, sizeof(time_str), "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
+  } else {
+    snprintf(time_str, sizeof(time_str), "00:00");
+    min_window_avg = 0.0;
+  }
+
   if (!read_access_token(access_token, sizeof(access_token))) {
     return 1;
   }
@@ -538,19 +718,30 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (!update_google_sheet(access_token, argv[1], row_index,
-                           f0, f1, f2, f3,
-                           global_min, global_max,
-                           bestday_str, worstday_str, minday_str)) {
-    fprintf(stderr, "Error: failed to update Google Sheet\n");
+  // Update monthly tab "pun"
+  if (!update_google_sheet_pun(access_token, aaaamm, row_index_pun,
+                               f0, f1, f2, f3,
+                               global_min, global_max,
+                               bestday_str, worstday_str, minday_str)) {
+    fprintf(stderr, "Error: failed to update Google Sheet tab pun\n");
     curl_global_cleanup();
     return 1;
   }
 
-  printf("OK: Updated Sheet row %d for %s\n", row_index, argv[1]);
+  // Update daily window tab "h"
+  if (!update_google_sheet_h(access_token, row_index_h,
+                             date_str, time_str, min_window_avg)) {
+    fprintf(stderr, "Error: failed to update Google Sheet tab h\n");
+    curl_global_cleanup();
+    return 1;
+  }
+
+  printf("OK: Updated Sheet 'pun' row %d for month %s\n", row_index_pun, aaaamm);
   printf("F0: %.5f | F1: %.5f | F2: %.5f | F3: %.5f\n", f0, f1, f2, f3);
   printf("MIN: %.5f | MAX: %.5f | BESTDAY: %s | WORSTDAY: %s | MINDAY: %s\n",
          global_min, global_max, bestday_str, worstday_str, minday_str);
+  printf("OK: Updated Sheet 'h' row %d for date %s -> Start: %s | 3h Avg: %.5f €/MWh\n",
+         row_index_h, date_str, time_str, min_window_avg);
 
   curl_global_cleanup();
   return 0;

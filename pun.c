@@ -1,5 +1,6 @@
-// Gianluca Mazzini @2026- Version 1.16
+// Gianluca Mazzini @2026- Version 1.18
 // Writes PUN monthly results and daily 3-hour minimum window to Google Sheets
+// Sorts sheets ascending before update and descending after update
 // Accepts input parameter in format YYYYMMDD (e.g. 20260715)
 
 #include <stdio.h>
@@ -19,6 +20,10 @@
 #define SPREADSHEET_ID "1RF4N-T2NR2UHai70AzTzwuLXowkLlOQWvFyb8AaE1xg"
 #define SHEET_NAME_PUN "pun"
 #define SHEET_NAME_H "h"
+
+// Google Sheet Numerical IDs (gid in Google Sheets URL)
+#define SHEET_ID_PUN 0
+#define SHEET_ID_H 1
 
 // Max 15-minute intervals in a month and 3-hour window slots
 #define MAX_RECORDS 3500
@@ -101,6 +106,101 @@ static int read_access_token(char *buf, size_t buflen) {
     return 0;
   }
 
+  return 1;
+}
+
+// Sort range in Google Sheet using batchUpdate API
+static int sort_google_sheet_range(const char *token, int sheet_id,
+                                   int start_row, int end_row,
+                                   int start_col, int end_col,
+                                   int sort_col_idx, int ascending) {
+  CURL *curl;
+  struct curl_slist *headers;
+  struct mem body;
+  CURLcode res;
+  long http_code;
+  char url[512], json_payload[1024], auth_header[1024];
+
+  curl = NULL;
+  headers = NULL;
+  body.ptr = NULL;
+  body.len = 0;
+  res = CURLE_OK;
+  http_code = 0;
+
+  snprintf(url, sizeof(url),
+    "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
+    SPREADSHEET_ID);
+
+  snprintf(json_payload, sizeof(json_payload),
+    "{"
+    "\"requests\":[{"
+      "\"sortRange\":{"
+        "\"range\":{"
+          "\"sheetId\":%d,"
+          "\"startRowIndex\":%d,"
+          "\"endRowIndex\":%d,"
+          "\"startColumnIndex\":%d,"
+          "\"endColumnIndex\":%d"
+        "},"
+        "\"sortSpecs\":[{"
+          "\"dimensionIndex\":%d,"
+          "\"sortOrder\":\"%s\""
+        "}]"
+      "}"
+    "}]"
+    "}",
+    sheet_id, start_row, end_row, start_col, end_col,
+    sort_col_idx, ascending ? "ASCENDING" : "DESCENDING");
+
+  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+
+  mem_init(&body);
+
+  curl = curl_easy_init();
+  if (curl == NULL) {
+    free(body.ptr);
+    return 0;
+  }
+
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, auth_header);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+
+  res = curl_easy_perform(curl);
+  if (res != CURLE_OK) {
+    fprintf(stderr, "Google Sheets API (sort) curl error: %s\n", curl_easy_strerror(res));
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body.ptr);
+    return 0;
+  }
+
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  if (http_code < 200 || http_code >= 300) {
+    fprintf(stderr, "Google Sheets API (sort) HTTP %ld\n", http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body.ptr);
+    return 0;
+  }
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  free(body.ptr);
   return 1;
 }
 
@@ -718,7 +818,11 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Update monthly tab "pun"
+  // Step 1: Sort sheets ASCENDING prior to writing to match index row mapping
+  sort_google_sheet_range(access_token, SHEET_ID_PUN, 1, 1000, 0, 10, 0, 1);
+  sort_google_sheet_range(access_token, SHEET_ID_H, 1, 5000, 0, 3, 0, 1);
+
+  // Step 2: Update monthly tab "pun" and daily window tab "h"
   if (!update_google_sheet_pun(access_token, aaaamm, row_index_pun,
                                f0, f1, f2, f3,
                                global_min, global_max,
@@ -728,13 +832,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Update daily window tab "h"
   if (!update_google_sheet_h(access_token, row_index_h,
                              date_str, time_str, min_window_avg)) {
     fprintf(stderr, "Error: failed to update Google Sheet tab h\n");
     curl_global_cleanup();
     return 1;
   }
+
+  // Step 3: Sort sheets DESCENDING after writing to present newest records on top
+  sort_google_sheet_range(access_token, SHEET_ID_PUN, 1, 1000, 0, 10, 0, 0);
+  sort_google_sheet_range(access_token, SHEET_ID_H, 1, 5000, 0, 3, 0, 0);
 
   printf("OK: Updated Sheet 'pun' row %d for month %s\n", row_index_pun, aaaamm);
   printf("F0: %.5f | F1: %.5f | F2: %.5f | F3: %.5f\n", f0, f1, f2, f3);

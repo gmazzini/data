@@ -1,6 +1,6 @@
-// Gianluca Mazzini @2026 - Version 1.19
+// Gianluca Mazzini @2026 - Version 1.20
 // Writes PUN monthly results and daily 3-hour minimum window to Google Sheets
-// Automatically resolves sheet IDs by name
+// Correctly parses sheet IDs for both 'pun' and 'h' tabs
 // Sorts sheets ascending before update and descending after update
 // Accepts input parameter in format YYYYMMDD (e.g. 20260810)
 
@@ -114,7 +114,7 @@ static int get_sheet_id_by_name(const char *token, const char *sheet_name) {
   CURLcode res;
   long http_code;
   char url[512], auth_header[1024], search_str[128];
-  char *p, *id_ptr, *block_start;
+  char *p_title, *search_ptr, *last_id_ptr, *next_id_ptr;
   int sheet_id;
 
   curl = NULL;
@@ -124,9 +124,10 @@ static int get_sheet_id_by_name(const char *token, const char *sheet_name) {
   res = CURLE_OK;
   http_code = 0;
   sheet_id = -1;
-  p = NULL;
-  id_ptr = NULL;
-  block_start = NULL;
+  p_title = NULL;
+  search_ptr = NULL;
+  last_id_ptr = NULL;
+  next_id_ptr = NULL;
 
   snprintf(url, sizeof(url),
     "https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties(sheetId,title)",
@@ -175,18 +176,27 @@ static int get_sheet_id_by_name(const char *token, const char *sheet_name) {
   }
 
   snprintf(search_str, sizeof(search_str), "\"title\": \"%s\"", sheet_name);
-  p = strstr(body.ptr, search_str);
-  if (p == NULL) {
+  p_title = strstr(body.ptr, search_str);
+  if (p_title == NULL) {
     snprintf(search_str, sizeof(search_str), "\"title\":\"%s\"", sheet_name);
-    p = strstr(body.ptr, search_str);
+    p_title = strstr(body.ptr, search_str);
   }
 
-  if (p != NULL) {
-    block_start = (p - 150 > body.ptr) ? (p - 150) : body.ptr;
-    id_ptr = strstr(block_start, "\"sheetId\":");
-    if (id_ptr != NULL) {
-      if (sscanf(id_ptr, "\"sheetId\": %d", &sheet_id) != 1) {
-        sscanf(id_ptr, "\"sheetId\":%d", &sheet_id);
+  if (p_title != NULL) {
+    search_ptr = body.ptr;
+    while (search_ptr != NULL && search_ptr < p_title) {
+      next_id_ptr = strstr(search_ptr, "\"sheetId\":");
+      if (next_id_ptr != NULL && next_id_ptr < p_title) {
+        last_id_ptr = next_id_ptr;
+        search_ptr = next_id_ptr + 10;
+      } else {
+        break;
+      }
+    }
+
+    if (last_id_ptr != NULL) {
+      if (sscanf(last_id_ptr, "\"sheetId\": %d", &sheet_id) != 1) {
+        sscanf(last_id_ptr, "\"sheetId\":%d", &sheet_id);
       }
     }
   }

@@ -1,706 +1,911 @@
-// Gianluca Mazzini @2026- Version 1.25
+// Gianluca Mazzini @2026- Version 1.27
+// Analyzes annual kWh data, PUN costs and ARERA bands, then updates Google Sheets
+
+#include <ctype.h>
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
 #include <curl/curl.h>
 #include <mysql/mysql.h>
+#include "energy_config.h"
 
-// Energy setup configuration providing USER, PASSWORD, DB
-#include "/home/tools/setup_energy.c"
-
-// Target file locations and IDs
 #define TOKEN_FILE "/home/www/data/google_access_token"
 #define SPREADSHEET_ID "1fw-Nq7RPMs9JF4bb62LGrXuqg81v1bPJjupOmGsCCqg"
+#define HTTP_BUFFER_START 4096
+#define TOKEN_SIZE 4096
+#define AUTH_HEADER_SIZE 4352
+#define URL_SIZE 768
+#define JSON_SIZE 65536
+#define QUERY_SIZE 1024
+#define MONTHS 12
+#define DAYS 32
+#define HOURS 24
+#define BANDS 4
+#define BOUNDARIES 13
+#define BOUNDARY_WINDOW 3600
 
-// Max 15-min intervals in a leap year: 366 * 96 = 35136
-#define MAX_PUN_SLOTS 36000
+struct mem {
+  char *ptr;
+  size_t len;
+  size_t cap;
+};
 
-// Memory buffer structure for HTTP payload
-typedef struct {
-  char *data;
-  size_t size;
-} MemoryBuffer;
-
-// Calculate Easter Monday date using Anonymous Gauss algorithm
 static void get_easter_monday(int year, int *out_m, int *out_d) {
-  int a, b, c, d, e, f, g, h, i, k, l, m;
-  int month_e, day_e;
+  int a, b, c, d, e, f, g, h, i, k, l, m, month_e, day_e;
 
-  a = year % 19;
-  b = year / 100;
-  c = year % 100;
-  d = b / 4;
-  e = b % 4;
-  f = (b + 8) / 25;
-  g = (b - f + 1) / 3;
-  h = (19 * a + b - d - g + 15) % 30;
-  i = c / 4;
-  k = c % 4;
-  l = (32 + 2 * e + 2 * i - h - k) % 7;
-  m = (a + 11 * h + 22 * l) / 451;
-  month_e = (h + l - 7 * m + 114) / 31;
-  day_e = ((h + l - 7 * m + 114) % 31) + 1;
+  a=year%19;
+  b=year/100;
+  c=year%100;
+  d=b/4;
+  e=b%4;
+  f=(b+8)/25;
+  g=(b-f+1)/3;
+  h=(19*a+b-d-g+15)%30;
+  i=c/4;
+  k=c%4;
+  l=(32+2*e+2*i-h-k)%7;
+  m=(a+11*h+22*l)/451;
+  month_e=(h+l-7*m+114)/31;
+  day_e=((h+l-7*m+114)%31)+1;
 
-  if (month_e == 3) {
-    if (day_e < 31) {
-      *out_m = 3;
-      *out_d = day_e + 1;
-    } else {
-      *out_m = 4;
-      *out_d = 1;
-    }
+  if (month_e==3 && day_e==31) {
+    *out_m=4;
+    *out_d=1;
   } else {
-    *out_m = 4;
-    *out_d = day_e + 1;
+    *out_m=month_e;
+    *out_d=day_e+1;
   }
 }
 
-// Check if a given date is an Italian national holiday
 static int is_festivo(const struct tm *tm) {
   int m, d, y, em_m, em_d;
 
-  m = tm->tm_mon + 1;
-  d = tm->tm_mday;
-  y = tm->tm_year + 1900;
-  em_m = 0;
-  em_d = 0;
-
-  if ((m == 1 && d == 1) || (m == 1 && d == 6) ||
-      (m == 4 && d == 25) || (m == 5 && d == 1) ||
-      (m == 6 && d == 2) || (m == 8 && d == 15) ||
-      (m == 11 && d == 1) || (m == 12 && d == 8) ||
-      (m == 12 && d == 25) || (m == 12 && d == 26)) {
+  m=tm->tm_mon+1;
+  d=tm->tm_mday;
+  y=tm->tm_year+1900;
+  if ((m==1 && d==1) || (m==1 && d==6) || (m==4 && d==25) ||
+      (m==5 && d==1) || (m==6 && d==2) || (m==8 && d==15) ||
+      (m==11 && d==1) || (m==12 && d==8) || (m==12 && d==25) ||
+      (m==12 && d==26)) {
     return 1;
   }
 
-  get_easter_monday(y, &em_m, &em_d);
-  if (m == em_m && d == em_d) {
-    return 1;
-  }
-
-  return 0;
+  get_easter_monday(y,&em_m,&em_d);
+  return m==em_m && d==em_d;
 }
 
-// Determine ARERA tariff band index (1 = F1, 2 = F2, 3 = F3)
-static int get_band_index(const struct tm *t) {
+static int get_band_index(const struct tm *tm) {
   int wday, hour;
 
-  wday = t->tm_wday;
-  hour = t->tm_hour;
-
-  if (wday == 0 || is_festivo(t)) {
+  wday=tm->tm_wday;
+  hour=tm->tm_hour;
+  if (wday==0 || is_festivo(tm)) {
     return 3;
   }
-
-  if (wday == 6) {
-    return (hour >= 7 && hour < 23) ? 2 : 3;
+  if (wday==6) {
+    return hour>=7 && hour<23 ? 2 : 3;
   }
-
-  if (hour >= 8 && hour < 19) {
+  if (hour>=8 && hour<19) {
     return 1;
   }
-
-  if ((hour >= 7 && hour < 8) || (hour >= 19 && hour < 23)) {
+  if ((hour>=7 && hour<8) || (hour>=19 && hour<23)) {
     return 2;
   }
-
   return 3;
 }
 
-// Initialize memory buffer structure
-static void init_memory_buffer(MemoryBuffer *mem) {
-  mem->size = 0;
-  mem->data = (char *)malloc(1);
-  if (mem->data != NULL) {
-    mem->data[0] = '\0';
-  }
-}
+static int mem_init(struct mem *m) {
+  m->ptr=(char *)malloc(HTTP_BUFFER_START);
+  m->len=0;
+  m->cap=0;
 
-// Curl write callback to collect HTTP response body
-static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
-  MemoryBuffer *mem;
-  char *ptr;
-  size_t realsize;
-
-  realsize = size * nmemb;
-  mem = (MemoryBuffer *)userp;
-  ptr = (char *)realloc(mem->data, mem->size + realsize + 1);
-
-  if (ptr == NULL) {
+  if (m->ptr==NULL) {
     return 0;
   }
-
-  mem->data = ptr;
-  memcpy(&(mem->data[mem->size]), contents, realsize);
-  mem->size += realsize;
-  mem->data[mem->size] = '\0';
-
-  return realsize;
+  m->cap=HTTP_BUFFER_START;
+  m->ptr[0]='\0';
+  return 1;
 }
 
-// Read Google API OAuth2 token from file
-static int read_access_token(const char *filename, char *token, size_t token_size) {
+static void mem_free(struct mem *m) {
+  free(m->ptr);
+  m->ptr=NULL;
+  m->len=0;
+  m->cap=0;
+}
+
+static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+  struct mem *m;
+  char *p;
+  size_t real_size, needed, new_cap;
+
+  m=(struct mem *)userp;
+  if (nmemb!=0 && size>((size_t)-1)/nmemb) {
+    return 0;
+  }
+  real_size=size*nmemb;
+  if (real_size>((size_t)-1)-m->len-1) {
+    return 0;
+  }
+  needed=m->len+real_size+1;
+
+  if (needed>m->cap) {
+    new_cap=m->cap;
+    for (;new_cap<needed;) {
+      if (new_cap>((size_t)-1)/2) {
+        new_cap=needed;
+        break;
+      }
+      new_cap*=2;
+    }
+    p=(char *)realloc(m->ptr,new_cap);
+    if (p==NULL) {
+      return 0;
+    }
+    m->ptr=p;
+    m->cap=new_cap;
+  }
+
+  memcpy(m->ptr+m->len,contents,real_size);
+  m->len+=real_size;
+  m->ptr[m->len]='\0';
+  return real_size;
+}
+
+static int read_access_token(char *token, size_t cap) {
   FILE *fp;
 
-  fp = fopen(filename, "r");
-  if (fp == NULL) {
-    fprintf(stderr, "Error: Unable to open token file %s\n", filename);
+  fp=fopen(TOKEN_FILE,"r");
+  if (fp==NULL) {
+    fprintf(stderr,"Error: unable to open token file %s\n",TOKEN_FILE);
     return 0;
   }
-
-  if (fgets(token, (int)token_size, fp) == NULL) {
+  if (fgets(token,(int)cap,fp)==NULL) {
     fclose(fp);
-    fprintf(stderr, "Error: Unable to read access token\n");
+    fprintf(stderr,"Error: unable to read access token\n");
     return 0;
   }
-
   fclose(fp);
-  token[strcspn(token, "\r\n")] = '\0';
 
-  if (token[0] == '\0') {
-    fprintf(stderr, "Error: Empty access token\n");
+  token[strcspn(token,"\r\n")]='\0';
+  if (*token=='\0') {
+    fprintf(stderr,"Error: empty access token\n");
     return 0;
   }
-
   return 1;
 }
 
-// Convert 1-based column index to A1 spreadsheet column letters
-static void get_column_letter(int col_idx, char *out) {
-  char temp[16];
-  int i, j, rem;
+static int appendf(char *buf, size_t cap, size_t *used, const char *fmt, ...) {
+  va_list ap;
+  int n;
 
-  i = 0;
-  j = 0;
-  rem = 0;
-  memset(temp, 0, sizeof(temp));
-
-  for (; col_idx > 0; col_idx = (col_idx - 1) / 26) {
-    rem = (col_idx - 1) % 26;
-    temp[i] = (char)('A' + rem);
-    i++;
+  if (*used>=cap) {
+    return 0;
   }
-
-  for (j = 0; j < i; j++) {
-    out[j] = temp[i - 1 - j];
+  va_start(ap,fmt);
+  n=vsnprintf(buf+*used,cap-*used,fmt,ap);
+  va_end(ap);
+  if (n<0 || (size_t)n>=cap-*used) {
+    return 0;
   }
-  out[i] = '\0';
+  *used+=(size_t)n;
+  return 1;
 }
 
-// Execute HTTP PUT request to update range in Google Sheets API
-static int put_google_sheet_range(const char *token, const char *sheet_name,
-                                 const char *range_str, const char *json_payload) {
+static int update_google_sheets(const char *token, const char *hourly_tab,
+    const char *hourly_range, const char *monthly_tab, const char *monthly_range,
+    const char *compare_tab, const char *compare_range, int include_compare,
+    const double hourly_sum[HOURS], double hourly_total,
+    const double monthly_sum[MONTHS][BANDS],
+    const double annual_totals[BANDS], const double energy_monthly[MONTHS],
+    double energy_annual, const double monthly_cp[MONTHS],
+    const double monthly_cf[MONTHS], const int monthly_sup[MONTHS],
+    double total_cp, double total_cf, int total_sup) {
   CURL *curl;
-  struct curl_slist *headers;
-  MemoryBuffer body;
-  CURLcode res;
+  struct curl_slist *headers, *tmp_headers;
+  struct mem body;
+  CURLcode rc;
+  char auth_header[AUTH_HEADER_SIZE], url[URL_SIZE];
+  char *json;
+  size_t used;
   long http_code;
-  char url[1024], auth_header[1024];
+  int h, m, n, ok;
 
-  curl = NULL;
-  headers = NULL;
-  body.data = NULL;
-  body.size = 0;
-  http_code = 0;
+  curl=NULL;
+  headers=NULL;
+  tmp_headers=NULL;
+  body.ptr=NULL;
+  body.len=0;
+  body.cap=0;
+  json=NULL;
+  used=0;
+  ok=0;
 
-  snprintf(url, sizeof(url),
-      "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!%s?valueInputOption=USER_ENTERED",
-      SPREADSHEET_ID, sheet_name, range_str);
-
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-  init_memory_buffer(&body);
-
-  curl = curl_easy_init();
-  if (curl == NULL) {
-    free(body.data);
+  if (!mem_init(&body)) {
+    fprintf(stderr,"Error: HTTP memory allocation failed\n");
+    return 0;
+  }
+  json=(char *)malloc(JSON_SIZE);
+  if (json==NULL) {
+    fprintf(stderr,"Error: JSON memory allocation failed\n");
+    mem_free(&body);
     return 0;
   }
 
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, auth_header);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-
-  res = curl_easy_perform(curl);
-  if (res != CURLE_OK) {
-    fprintf(stderr, "Curl error: %s\n", curl_easy_strerror(res));
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.data);
-    return 0;
+  n=snprintf(auth_header,sizeof(auth_header),"Authorization: Bearer %s",token);
+  if (n<0 || n>=(int)sizeof(auth_header)) {
+    fprintf(stderr,"Error: access token too long\n");
+    goto cleanup;
+  }
+  n=snprintf(url,sizeof(url),
+      "https://sheets.googleapis.com/v4/spreadsheets/%s/values:batchUpdate",
+      SPREADSHEET_ID);
+  if (n<0 || n>=(int)sizeof(url)) {
+    goto cleanup;
   }
 
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API Error HTTP %ld on tab %s (range %s)\n", http_code, sheet_name, range_str);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.data);
-    return 0;
+  if (!appendf(json,JSON_SIZE,&used,
+      "{\"valueInputOption\":\"USER_ENTERED\",\"data\":["
+      "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[",
+      hourly_tab,hourly_range)) {
+    goto json_error;
+  }
+  for (h=0;h<HOURS;h++) {
+    if (!appendf(json,JSON_SIZE,&used,"[%.5f],",hourly_sum[h])) {
+      goto json_error;
+    }
+  }
+  if (!appendf(json,JSON_SIZE,&used,"[%.5f]]},",hourly_total) ||
+      !appendf(json,JSON_SIZE,&used,
+      "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[",
+      monthly_tab,monthly_range)) {
+    goto json_error;
+  }
+  for (m=0;m<MONTHS;m++) {
+    if (!appendf(json,JSON_SIZE,&used,"[%.5f,%.5f,%.5f,%.5f],",
+        monthly_sum[m][0],monthly_sum[m][1],monthly_sum[m][2],monthly_sum[m][3])) {
+      goto json_error;
+    }
+  }
+  if (!appendf(json,JSON_SIZE,&used,"[%.5f,%.5f,%.5f,%.5f]]}",
+      annual_totals[0],annual_totals[1],annual_totals[2],annual_totals[3])) {
+    goto json_error;
   }
 
+  if (include_compare) {
+    if (!appendf(json,JSON_SIZE,&used,
+        ",{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[",
+        compare_tab,compare_range)) {
+      goto json_error;
+    }
+    for (m=0;m<MONTHS;m++) {
+      if (!appendf(json,JSON_SIZE,&used,"[%.5f,%.5f,%.5f,%.5f,%d],",
+          monthly_sum[m][3],energy_monthly[m],monthly_cp[m],monthly_cf[m],
+          monthly_sup[m])) {
+        goto json_error;
+      }
+    }
+    if (!appendf(json,JSON_SIZE,&used,"[%.5f,%.5f,%.5f,%.5f,%d]]}",
+        annual_totals[3],energy_annual,total_cp,total_cf,total_sup)) {
+      goto json_error;
+    }
+  }
+  if (!appendf(json,JSON_SIZE,&used,"]}")) {
+    goto json_error;
+  }
+
+  curl=curl_easy_init();
+  if (curl==NULL) {
+    fprintf(stderr,"Error: curl_easy_init failed\n");
+    goto cleanup;
+  }
+  headers=curl_slist_append(NULL,"Content-Type: application/json");
+  if (headers==NULL) {
+    fprintf(stderr,"Error: curl header allocation failed\n");
+    goto cleanup;
+  }
+  tmp_headers=curl_slist_append(headers,auth_header);
+  if (tmp_headers==NULL) {
+    fprintf(stderr,"Error: curl header allocation failed\n");
+    goto cleanup;
+  }
+  headers=tmp_headers;
+  tmp_headers=NULL;
+
+  curl_easy_setopt(curl,CURLOPT_URL,url);
+  curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
+  curl_easy_setopt(curl,CURLOPT_POST,1L);
+  curl_easy_setopt(curl,CURLOPT_POSTFIELDS,json);
+  curl_easy_setopt(curl,CURLOPT_POSTFIELDSIZE,(long)used);
+  curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,write_cb);
+  curl_easy_setopt(curl,CURLOPT_WRITEDATA,&body);
+  curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);
+  curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,2L);
+  curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT,15L);
+  curl_easy_setopt(curl,CURLOPT_TIMEOUT,60L);
+  curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
+  curl_easy_setopt(curl,CURLOPT_USERAGENT,"kwh_analisys/1.26");
+
+  rc=curl_easy_perform(curl);
+  if (rc!=CURLE_OK) {
+    fprintf(stderr,"Google Sheets curl error: %s\n",curl_easy_strerror(rc));
+    goto cleanup;
+  }
+  http_code=0;
+  if (curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&http_code)!=CURLE_OK) {
+    fprintf(stderr,"Error: unable to read Google HTTP status\n");
+    goto cleanup;
+  }
+  if (http_code<200 || http_code>=300) {
+    fprintf(stderr,"Google Sheets HTTP %ld: %.1000s\n",http_code,body.ptr);
+    goto cleanup;
+  }
+  ok=1;
+  goto cleanup;
+
+json_error:
+  fprintf(stderr,"Error: Google JSON buffer too small\n");
+
+cleanup:
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  free(body.data);
-  return 1;
+  if (curl!=NULL) {
+    curl_easy_cleanup(curl);
+  }
+  free(json);
+  mem_free(&body);
+  return ok;
 }
 
-// Compute epoch timestamp for 1st day of month
-static time_t get_month_boundary_epoch(int year, int mon) {
+static time_t month_boundary(int year, int month) {
   struct tm tm_target;
 
-  memset(&tm_target, 0, sizeof(struct tm));
-  tm_target.tm_year = year - 1900 + (mon / 12);
-  tm_target.tm_mon = mon % 12;
-  tm_target.tm_mday = 1;
-  tm_target.tm_hour = 0;
-  tm_target.tm_min = 0;
-  tm_target.tm_sec = 0;
-  tm_target.tm_isdst = -1;
-
+  memset(&tm_target,0,sizeof(tm_target));
+  tm_target.tm_year=year-1900+month/12;
+  tm_target.tm_mon=month%12;
+  tm_target.tm_mday=1;
+  tm_target.tm_isdst=-1;
   return mktime(&tm_target);
 }
 
-int main(int argc, char *argv[]) {
-  // Loop counters and index variables
-  int i, m, h, d, b, off, slot;
-  int hour, month, band, day;
+static int parse_year(const char *text, int *year) {
+  char *end;
+  long value;
 
-  // Configurations and table offsets
-  int target_year, is_so, base_year_h_m, base_year_d;
-  int hourly_col_idx, start_m_col, end_m_col, start_d_col, end_d_col;
-  int E_found[13], monthly_sup[12], total_sup;
+  if (text==NULL || *text=='\0') {
+    return 0;
+  }
+  errno=0;
+  value=strtol(text,&end,10);
+  if (errno!=0 || end==text || *end!='\0' || value<1900 || value>2099) {
+    return 0;
+  }
+  *year=(int)value;
+  return 1;
+}
 
-  // Energy computations and cost aggregations
-  double val, diff, c_val, delta_e, prev_e_tot, cur_e_tot, cost_p, cost_f;
-  double hourly_total, energy_annual_total, total_cp, total_cF;
-  double hourly_sum[24], monthly_sum[12][4], monthly_annual_totals[4];
-  double E_boundary[13], energy_monthly_sum[12];
-  double pun_sums[12][4], pun_counts[12][4], F_monthly[12][4];
-  double monthly_cp[12], monthly_cF[12], daily_cp[12][32], daily_cF[12][32];
+static int parse_epoch(const char *text, time_t *value) {
+  char *end;
+  long long n;
 
-  // Fast In-Memory PUN Lookup Array
-  double *pun_lookup;
+  errno=0;
+  n=strtoll(text,&end,10);
+  if (errno!=0 || end==text || *end!='\0') {
+    return 0;
+  }
+  *value=(time_t)n;
+  return (long long)*value==n;
+}
 
-  // Time variables
-  time_t start_epoch, end_epoch, ep, prev_ep, t_b, ep_rounded;
-  struct tm start_tm, end_tm, local_tm, *t_ptr;
+static int parse_double(const char *text, double *value) {
+  char *end;
 
-  // Table strings, tokens, query buffers and Google Sheets JSON formatting
-  const char *measure_type, *energy_table;
-  char hourly_tab[16], monthly_tab[16], compare_tab[16];
-  char access_token[512], query[1024];
-  char hourly_col_letter[16], hourly_range[64];
-  char start_m_letter[16], end_m_letter[16], monthly_range[64];
-  char start_d_letter[16], end_d_letter[16], compare_range[64];
-  char *json_h, *json_m, *json_d;
+  errno=0;
+  *value=strtod(text,&end);
+  return errno==0 && end!=text && *end=='\0';
+}
 
-  // MySQL database handles
-  MYSQL *conn;
-  MYSQL_RES *res, *res_e, *res_pun, *res_energy;
-  MYSQL_ROW row, row_e, row_pun, row_en;
+static int get_column_letter(int col_idx, char *out, size_t cap) {
+  char tmp[16];
+  int i, j, rem;
 
-  // Variable initializations
-  i = 0; m = 0; h = 0; d = 0; b = 0; off = 0; slot = 0;
-  hour = 0; month = 0; band = 0; day = 0;
-  target_year = 0; is_so = 0; base_year_h_m = 0; base_year_d = 2025;
-  hourly_col_idx = 0; start_m_col = 0; end_m_col = 0; start_d_col = 0; end_d_col = 0;
-  total_sup = 0;
+  if (col_idx<=0) {
+    return 0;
+  }
+  i=0;
+  for (;col_idx>0;) {
+    if (i>=(int)sizeof(tmp)-1) {
+      return 0;
+    }
+    rem=(col_idx-1)%26;
+    tmp[i++]=(char)('A'+rem);
+    col_idx=(col_idx-1)/26;
+  }
+  if ((size_t)i+1>cap) {
+    return 0;
+  }
+  for (j=0;j<i;j++) {
+    out[j]=tmp[i-1-j];
+  }
+  out[i]='\0';
+  return 1;
+}
 
-  val = 0.0; diff = 0.0; c_val = 0.0; delta_e = 0.0; prev_e_tot = -1.0; cur_e_tot = 0.0;
-  cost_p = 0.0; cost_f = 0.0; hourly_total = 0.0; energy_annual_total = 0.0;
-  total_cp = 0.0; total_cF = 0.0;
+static long slot_index(time_t epoch, time_t start, size_t count) {
+  time_t rounded;
+  long long delta, slot;
 
-  memset(E_found, 0, sizeof(E_found));
-  memset(monthly_sup, 0, sizeof(monthly_sup));
-  memset(hourly_sum, 0, sizeof(hourly_sum));
-  memset(monthly_sum, 0, sizeof(monthly_sum));
-  memset(monthly_annual_totals, 0, sizeof(monthly_annual_totals));
-  memset(E_boundary, 0, sizeof(E_boundary));
-  memset(energy_monthly_sum, 0, sizeof(energy_monthly_sum));
-  memset(pun_sums, 0, sizeof(pun_sums));
-  memset(pun_counts, 0, sizeof(pun_counts));
-  memset(F_monthly, 0, sizeof(F_monthly));
-  memset(monthly_cp, 0, sizeof(monthly_cp));
-  memset(monthly_cF, 0, sizeof(monthly_cF));
-  memset(daily_cp, 0, sizeof(daily_cp));
-  memset(daily_cF, 0, sizeof(daily_cF));
+  if (epoch<start) {
+    return -1;
+  }
+  rounded=epoch-(epoch%900);
+  if (rounded<start) {
+    return -1;
+  }
+  delta=(long long)rounded-(long long)start;
+  slot=delta/900;
+  if (slot<0 || (unsigned long long)slot>=(unsigned long long)count) {
+    return -1;
+  }
+  return (long)slot;
+}
 
-  start_epoch = 0; end_epoch = 0; ep = 0; prev_ep = 0; t_b = 0; ep_rounded = 0;
-  memset(&start_tm, 0, sizeof(struct tm));
-  memset(&end_tm, 0, sizeof(struct tm));
-  memset(&local_tm, 0, sizeof(struct tm));
-  t_ptr = NULL;
+static int query_fiscal(MYSQL *conn, const char *table, time_t start,
+    time_t end, double hourly[HOURS], double monthly[MONTHS][BANDS],
+    double annual[BANDS], double *hourly_total) {
+  MYSQL_RES *res;
+  MYSQL_ROW row;
+  struct tm *tm_ptr;
+  time_t epoch;
+  double value;
+  char query[QUERY_SIZE];
+  int hour, month, band, n;
 
-  measure_type = NULL; energy_table = NULL;
-  json_h = NULL; json_m = NULL; json_d = NULL;
-
-  conn = NULL; res = NULL; res_e = NULL; res_pun = NULL; res_energy = NULL;
-  row = NULL; row_e = NULL; row_pun = NULL; row_en = NULL;
-
-  if (argc < 3) {
-    fprintf(stderr, "Usage: %s <kwh_so|kwh_cc> <year>\n", argv[0]);
-    return 1;
+  res=NULL;
+  n=snprintf(query,sizeof(query),
+      "SELECT epoch,kwh FROM %s WHERE epoch>=%ld AND epoch<%ld ORDER BY epoch",
+      table,(long)start,(long)end);
+  if (n<0 || n>=(int)sizeof(query) || mysql_query(conn,query)!=0) {
+    fprintf(stderr,"MySQL fiscal query error: %s\n",mysql_error(conn));
+    return 0;
+  }
+  res=mysql_use_result(conn);
+  if (res==NULL) {
+    fprintf(stderr,"MySQL fiscal result error: %s\n",mysql_error(conn));
+    return 0;
   }
 
-  measure_type = argv[1];
-  target_year = atoi(argv[2]);
+  for (row=mysql_fetch_row(res);row!=NULL;row=mysql_fetch_row(res)) {
+    if (row[0]==NULL || row[1]==NULL || !parse_epoch(row[0],&epoch) ||
+        !parse_double(row[1],&value)) {
+      fprintf(stderr,"Error: invalid fiscal database row\n");
+      mysql_free_result(res);
+      return 0;
+    }
+    tm_ptr=localtime(&epoch);
+    if (tm_ptr==NULL) {
+      fprintf(stderr,"Error: fiscal localtime conversion failed\n");
+      mysql_free_result(res);
+      return 0;
+    }
+    hour=tm_ptr->tm_hour;
+    month=tm_ptr->tm_mon;
+    band=get_band_index(tm_ptr);
 
-  if (strcmp(measure_type, "kwh_so") != 0 && strcmp(measure_type, "kwh_cc") != 0) {
-    fprintf(stderr, "Error: Invalid measure_type '%s'. Must be 'kwh_so' or 'kwh_cc'.\n", measure_type);
-    return 1;
+    hourly[hour]+=value;
+    *hourly_total+=value;
+    monthly[month][band-1]+=value;
+    monthly[month][3]+=value;
+    annual[band-1]+=value;
+    annual[3]+=value;
+  }
+  if (mysql_errno(conn)!=0) {
+    fprintf(stderr,"MySQL fiscal fetch error: %s\n",mysql_error(conn));
+    mysql_free_result(res);
+    return 0;
+  }
+  mysql_free_result(res);
+  return 1;
+}
+
+static int query_pun(MYSQL *conn, time_t start, time_t end,
+    double *lookup, unsigned char *valid, size_t slot_count,
+    double sums[MONTHS][BANDS], unsigned long counts[MONTHS][BANDS],
+    double averages[MONTHS][BANDS], unsigned long *loaded) {
+  MYSQL_RES *res;
+  MYSQL_ROW row;
+  struct tm *tm_ptr;
+  time_t epoch;
+  double value;
+  char query[QUERY_SIZE];
+  long slot;
+  int month, band, m, b, n;
+
+  res=NULL;
+  n=snprintf(query,sizeof(query),
+      "SELECT epoch,c FROM pun_15m WHERE epoch>=%ld AND epoch<%ld ORDER BY epoch",
+      (long)start,(long)end);
+  if (n<0 || n>=(int)sizeof(query) || mysql_query(conn,query)!=0) {
+    fprintf(stderr,"MySQL PUN query error: %s\n",mysql_error(conn));
+    return 0;
+  }
+  res=mysql_use_result(conn);
+  if (res==NULL) {
+    fprintf(stderr,"MySQL PUN result error: %s\n",mysql_error(conn));
+    return 0;
   }
 
-  is_so = (strcmp(measure_type, "kwh_so") == 0);
-  base_year_h_m = is_so ? 2021 : 2024;
-  energy_table = is_so ? "energy_so" : "energy_cc";
-
-  if (target_year < base_year_h_m || target_year > 2099) {
-    fprintf(stderr, "Error: Invalid target year %d.\n", target_year);
-    return 1;
-  }
-
-  setenv("TZ", "Europe/Rome", 1);
-  tzset();
-
-  snprintf(hourly_tab, sizeof(hourly_tab), "%s", is_so ? "h_so" : "h_cc");
-  snprintf(monthly_tab, sizeof(monthly_tab), "%s", is_so ? "m_so" : "m_cc");
-  snprintf(compare_tab, sizeof(compare_tab), "%s", is_so ? "d_so" : "d_cc");
-
-  if (!read_access_token(TOKEN_FILE, access_token, sizeof(access_token))) {
-    return 1;
-  }
-
-  // Allocate PUN 15-min lookup array in memory
-  pun_lookup = (double *)calloc(MAX_PUN_SLOTS, sizeof(double));
-  if (pun_lookup == NULL) {
-    fprintf(stderr, "Error: Memory allocation failed for PUN lookup table\n");
-    return 1;
-  }
-
-  conn = mysql_init(NULL);
-  if (conn == NULL) {
-    free(pun_lookup);
-    return 1;
-  }
-
-  if (mysql_real_connect(conn, "localhost", USER, PASSWORD, DB, 0, NULL, 0) == NULL) {
-    fprintf(stderr, "mysql connect error: %s\n", mysql_error(conn));
-    mysql_close(conn);
-    free(pun_lookup);
-    return 1;
-  }
-
-  start_tm.tm_year = target_year - 1900;
-  start_tm.tm_mon = 0;
-  start_tm.tm_mday = 1;
-  start_tm.tm_hour = 0;
-  start_tm.tm_min = 0;
-  start_tm.tm_sec = 0;
-  start_tm.tm_isdst = -1;
-
-  end_tm.tm_year = target_year - 1900;
-  end_tm.tm_mon = 11;
-  end_tm.tm_mday = 31;
-  end_tm.tm_hour = 23;
-  end_tm.tm_min = 59;
-  end_tm.tm_sec = 59;
-  end_tm.tm_isdst = -1;
-
-  start_epoch = mktime(&start_tm);
-  end_epoch = mktime(&end_tm);
-
-  // 1. Fiscal table processing (kwh_so / kwh_cc)
-  snprintf(query, sizeof(query),
-           "SELECT epoch, kwh FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-           measure_type, (long)start_epoch, (long)end_epoch);
-
-  if (mysql_query(conn, query) != 0) {
-    fprintf(stderr, "mysql query error: %s\n", mysql_error(conn));
-    mysql_close(conn);
-    free(pun_lookup);
-    return 1;
-  }
-
-  res = mysql_store_result(conn);
-  if (res == NULL) {
-    mysql_close(conn);
-    free(pun_lookup);
-    return 1;
-  }
-
-  for (row = mysql_fetch_row(res); row != NULL; row = mysql_fetch_row(res)) {
-    if (row[0] == NULL || row[1] == NULL) {
-      continue;
+  for (row=mysql_fetch_row(res);row!=NULL;row=mysql_fetch_row(res)) {
+    if (row[0]==NULL || row[1]==NULL || !parse_epoch(row[0],&epoch) ||
+        !parse_double(row[1],&value)) {
+      fprintf(stderr,"Error: invalid PUN database row\n");
+      mysql_free_result(res);
+      return 0;
     }
 
-    ep = (time_t)atoll(row[0]);
-    val = atof(row[1]);
-
-    t_ptr = localtime(&ep);
-    if (t_ptr == NULL) {
-      continue;
+    slot=slot_index(epoch,start,slot_count);
+    if (slot>=0) {
+      lookup[slot]=value;
+      valid[slot]=1;
+      (*loaded)++;
     }
 
-    hour = t_ptr->tm_hour;
-    month = t_ptr->tm_mon;
-    band = get_band_index(t_ptr);
-
-    if (hour >= 0 && hour < 24) {
-      hourly_sum[hour] += val;
-      hourly_total += val;
+    tm_ptr=localtime(&epoch);
+    if (tm_ptr==NULL) {
+      fprintf(stderr,"Error: PUN localtime conversion failed\n");
+      mysql_free_result(res);
+      return 0;
     }
-
-    if (month >= 0 && month < 12 && band >= 1 && band <= 3) {
-      monthly_sum[month][band - 1] += val;
-      monthly_sum[month][3] += val;
-      monthly_annual_totals[band - 1] += val;
-      monthly_annual_totals[3] += val;
-    }
+    month=tm_ptr->tm_mon;
+    band=get_band_index(tm_ptr);
+    sums[month][band]+=value;
+    counts[month][band]++;
+  }
+  if (mysql_errno(conn)!=0) {
+    fprintf(stderr,"MySQL PUN fetch error: %s\n",mysql_error(conn));
+    mysql_free_result(res);
+    return 0;
   }
   mysql_free_result(res);
 
-  // 2. Fast AND Precise search for monthly boundary values (colonna 2 misure d_*)
-  for (i = 0; i <= 12; i++) {
-    t_b = get_month_boundary_epoch(target_year, i);
-    snprintf(query, sizeof(query),
-             "SELECT (e1 + e2 + e3) FROM %s WHERE epoch BETWEEN %ld AND %ld "
-             "ORDER BY ABS(CAST(epoch AS SIGNED) - %ld) ASC LIMIT 1",
-             energy_table, (long)(t_b - 3600), (long)(t_b + 3600), (long)t_b);
-
-    if (mysql_query(conn, query) == 0) {
-      res_e = mysql_store_result(conn);
-      if (res_e != NULL) {
-        row_e = mysql_fetch_row(res_e);
-        if (row_e != NULL && row_e[0] != NULL) {
-          E_boundary[i] = atof(row_e[0]);
-          E_found[i] = 1;
-        }
-        mysql_free_result(res_e);
+  for (m=0;m<MONTHS;m++) {
+    for (b=1;b<=3;b++) {
+      if (counts[m][b]>0) {
+        averages[m][b]=sums[m][b]/(double)counts[m][b];
       }
     }
   }
+  return 1;
+}
 
-  for (m = 0; m < 12; m++) {
-    if (E_found[m] && E_found[m + 1]) {
-      diff = E_boundary[m + 1] - E_boundary[m];
-      if (diff > 0.0) {
-        energy_monthly_sum[m] = diff;
-        energy_annual_total += diff;
-      }
-    }
+static int query_energy(MYSQL *conn, const char *table, time_t start,
+    time_t end, const time_t boundary[BOUNDARIES], double boundary_value[BOUNDARIES],
+    unsigned char boundary_found[BOUNDARIES], double boundary_dist[BOUNDARIES],
+    const double *pun_lookup, const unsigned char *pun_valid, size_t slot_count,
+    const double f_monthly[MONTHS][BANDS],
+    const unsigned long pun_counts[MONTHS][BANDS], double monthly_cp[MONTHS],
+    double monthly_cf[MONTHS], double daily_cp[MONTHS][DAYS],
+    double daily_cf[MONTHS][DAYS], unsigned long *cost_intervals,
+    unsigned long *missing_pun) {
+  MYSQL_RES *res;
+  MYSQL_ROW row;
+  struct tm *tm_ptr;
+  time_t epoch, prev_epoch;
+  double current, prev, delta, price, cost_p, cost_f, dist;
+  char query[QUERY_SIZE];
+  long slot;
+  int i, month, day, band, n;
+
+  res=NULL;
+  prev=-1.0;
+  prev_epoch=0;
+  n=snprintf(query,sizeof(query),
+      "SELECT epoch,(e1+e2+e3) FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch",
+      table,(long)(boundary[0]-BOUNDARY_WINDOW),
+      (long)(boundary[BOUNDARIES-1]+BOUNDARY_WINDOW));
+  if (n<0 || n>=(int)sizeof(query) || mysql_query(conn,query)!=0) {
+    fprintf(stderr,"MySQL energy query error: %s\n",mysql_error(conn));
+    return 0;
+  }
+  res=mysql_use_result(conn);
+  if (res==NULL) {
+    fprintf(stderr,"MySQL energy result error: %s\n",mysql_error(conn));
+    return 0;
   }
 
-  // 3. Load entire year of PUN prices into RAM array and compute monthly F1/F2/F3 averages
-  snprintf(query, sizeof(query),
-           "SELECT epoch, c FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-           (long)start_epoch, (long)end_epoch);
-
-  if (mysql_query(conn, query) == 0) {
-    res_pun = mysql_store_result(conn);
-    if (res_pun != NULL) {
-      for (row_pun = mysql_fetch_row(res_pun); row_pun != NULL; row_pun = mysql_fetch_row(res_pun)) {
-        if (row_pun[0] == NULL || row_pun[1] == NULL) {
-          continue;
-        }
-
-        ep = (time_t)atoll(row_pun[0]);
-        c_val = atof(row_pun[1]);
-
-        // Round timestamp to nearest 15-minute slot
-        ep_rounded = ep - (ep % 900);
-        slot = (int)((ep_rounded - start_epoch) / 900);
-        if (slot >= 0 && slot < MAX_PUN_SLOTS) {
-          pun_lookup[slot] = c_val;
-        }
-
-        localtime_r(&ep, &local_tm);
-        m = local_tm.tm_mon;
-        band = get_band_index(&local_tm);
-
-        if (m >= 0 && m < 12 && band >= 1 && band <= 3) {
-          pun_sums[m][band] += c_val;
-          pun_counts[m][band] += 1.0;
-        }
-      }
-      mysql_free_result(res_pun);
+  for (row=mysql_fetch_row(res);row!=NULL;row=mysql_fetch_row(res)) {
+    if (row[0]==NULL || row[1]==NULL || !parse_epoch(row[0],&epoch) ||
+        !parse_double(row[1],&current)) {
+      fprintf(stderr,"Error: invalid energy database row\n");
+      mysql_free_result(res);
+      return 0;
     }
-  }
 
-  for (m = 0; m < 12; m++) {
-    for (b = 1; b <= 3; b++) {
-      if (pun_counts[m][b] > 0.0) {
-        F_monthly[m][b] = pun_sums[m][b] / pun_counts[m][b];
+    for (i=0;i<BOUNDARIES;i++) {
+      dist=fabs(difftime(epoch,boundary[i]));
+      if (dist<=(double)BOUNDARY_WINDOW && dist<boundary_dist[i]) {
+        boundary_dist[i]=dist;
+        boundary_value[i]=current;
+        boundary_found[i]=1;
       }
     }
-  }
 
-  // 4. Compute cp, cF, sup processing energy meters directly in C
-  snprintf(query, sizeof(query),
-           "SELECT epoch, (e1 + e2 + e3) FROM %s WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-           energy_table, (long)start_epoch, (long)end_epoch);
-
-  if (mysql_query(conn, query) == 0) {
-    res_energy = mysql_store_result(conn);
-    if (res_energy != NULL) {
-      prev_e_tot = -1.0;
-      prev_ep = 0;
-
-      for (row_en = mysql_fetch_row(res_energy); row_en != NULL; row_en = mysql_fetch_row(res_energy)) {
-        if (row_en[0] == NULL || row_en[1] == NULL) {
-          continue;
-        }
-
-        ep = (time_t)atoll(row_en[0]);
-        cur_e_tot = atof(row_en[1]);
-
-        localtime_r(&ep, &local_tm);
-        m = local_tm.tm_mon;
-        day = local_tm.tm_mday;
-        band = get_band_index(&local_tm);
-
-        // Fetch pre-loaded PUN price from memory using rounded timestamp
-        ep_rounded = ep - (ep % 900);
-        slot = (int)((ep_rounded - start_epoch) / 900);
-        c_val = (slot >= 0 && slot < MAX_PUN_SLOTS) ? pun_lookup[slot] : 0.0;
-
-        if (prev_e_tot >= 0.0 && prev_ep > 0) {
-          // Check for valid sampling window (between 1 min and 20 mins)
-          if ((ep - prev_ep) >= 60 && (ep - prev_ep) <= 1200) {
-            delta_e = cur_e_tot - prev_e_tot;
-            if (delta_e > 0.0 && delta_e < 100.0) {
-
-              // Correct price calculations dividing PUN (€/MWh) by 1000.0 to get €/kWh
-              cost_p = delta_e * (c_val / 1000.0);
-              cost_f = delta_e * (F_monthly[m][band] / 1000.0);
-
-              if (m >= 0 && m < 12) {
-                monthly_cp[m] += cost_p;
-                monthly_cF[m] += cost_f;
-
-                if (day >= 1 && day <= 31) {
-                  daily_cp[m][day] += cost_p;
-                  daily_cF[m][day] += cost_f;
-                }
-              }
-            }
-          }
-        }
-        prev_e_tot = cur_e_tot;
-        prev_ep = ep;
-      }
-      mysql_free_result(res_energy);
+    if (epoch<start || epoch>=end) {
+      continue;
     }
-  }
 
-  // Calculate monthly unfavorable days (sup) and totals
-  for (m = 0; m < 12; m++) {
-    monthly_sup[m] = 0;
-    for (d = 1; d <= 31; d++) {
-      if (daily_cp[m][d] > 0.0 && daily_cp[m][d] > daily_cF[m][d]) {
-        monthly_sup[m]++;
+    tm_ptr=localtime(&epoch);
+    if (tm_ptr==NULL) {
+      fprintf(stderr,"Error: energy localtime conversion failed\n");
+      mysql_free_result(res);
+      return 0;
+    }
+    month=tm_ptr->tm_mon;
+    day=tm_ptr->tm_mday;
+    band=get_band_index(tm_ptr);
+
+    if (prev>=0.0 && prev_epoch>0 && epoch-prev_epoch>=60 &&
+        epoch-prev_epoch<=1200) {
+      delta=current-prev;
+      if (delta>0.0 && delta<100.0) {
+        slot=slot_index(epoch,start,slot_count);
+        if (slot<0 || !pun_valid[slot] || pun_counts[month][band]==0) {
+          (*missing_pun)++;
+        } else {
+          price=pun_lookup[slot];
+          cost_p=delta*(price/1000.0);
+          cost_f=delta*(f_monthly[month][band]/1000.0);
+          monthly_cp[month]+=cost_p;
+          monthly_cf[month]+=cost_f;
+          daily_cp[month][day]+=cost_p;
+          daily_cf[month][day]+=cost_f;
+          (*cost_intervals)++;
+        }
       }
     }
-    total_cp += monthly_cp[m];
-    total_cF += monthly_cF[m];
-    total_sup += monthly_sup[m];
+    prev=current;
+    prev_epoch=epoch;
   }
+  if (mysql_errno(conn)!=0) {
+    fprintf(stderr,"MySQL energy fetch error: %s\n",mysql_error(conn));
+    mysql_free_result(res);
+    return 0;
+  }
+  mysql_free_result(res);
+  return 1;
+}
 
-  mysql_close(conn);
-  free(pun_lookup);
+int main(int argc, char *argv[]) {
+  MYSQL *conn;
+  EnergyConfig cfg;
+  char cfg_err[256];
+  const char *measure_type, *energy_table;
+  double hourly_sum[HOURS], monthly_sum[MONTHS][BANDS];
+  double annual_totals[BANDS], energy_monthly[MONTHS];
+  double pun_sums[MONTHS][BANDS], f_monthly[MONTHS][BANDS];
+  double monthly_cp[MONTHS], monthly_cf[MONTHS];
+  double daily_cp[MONTHS][DAYS], daily_cf[MONTHS][DAYS];
+  double boundary_value[BOUNDARIES], boundary_dist[BOUNDARIES];
+  double *pun_lookup;
+  unsigned long pun_counts[MONTHS][BANDS];
+  unsigned char boundary_found[BOUNDARIES], *pun_valid;
+  time_t boundary[BOUNDARIES], start_epoch, end_epoch;
+  size_t slot_count;
+  double hourly_total, energy_annual, total_cp, total_cf, diff;
+  unsigned long pun_loaded, cost_intervals, missing_pun;
+  int monthly_sup[MONTHS], total_sup;
+  int target_year, is_so, base_year_hm, base_year_d;
+  int hourly_col, start_m_col, end_m_col, start_d_col, end_d_col;
+  int m, d, i, include_compare, status;
+  char hourly_tab[16], monthly_tab[16], compare_tab[16];
+  char hourly_letter[16], start_m_letter[16], end_m_letter[16];
+  char start_d_letter[16], end_d_letter[16];
+  char hourly_range[64], monthly_range[64], compare_range[64];
+  char token[TOKEN_SIZE];
 
-  if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+  conn=NULL;
+  measure_type=NULL;
+  energy_table=NULL;
+  pun_lookup=NULL;
+  pun_valid=NULL;
+  memset(hourly_sum,0,sizeof(hourly_sum));
+  memset(monthly_sum,0,sizeof(monthly_sum));
+  memset(annual_totals,0,sizeof(annual_totals));
+  memset(energy_monthly,0,sizeof(energy_monthly));
+  memset(pun_sums,0,sizeof(pun_sums));
+  memset(pun_counts,0,sizeof(pun_counts));
+  memset(f_monthly,0,sizeof(f_monthly));
+  memset(monthly_cp,0,sizeof(monthly_cp));
+  memset(monthly_cf,0,sizeof(monthly_cf));
+  memset(daily_cp,0,sizeof(daily_cp));
+  memset(daily_cf,0,sizeof(daily_cf));
+  memset(boundary_value,0,sizeof(boundary_value));
+  memset(boundary_found,0,sizeof(boundary_found));
+  memset(monthly_sup,0,sizeof(monthly_sup));
+  for (i=0;i<BOUNDARIES;i++) {
+    boundary_dist[i]=DBL_MAX;
+  }
+  hourly_total=0.0;
+  energy_annual=0.0;
+  total_cp=0.0;
+  total_cf=0.0;
+  pun_loaded=0;
+  cost_intervals=0;
+  missing_pun=0;
+  total_sup=0;
+  status=1;
+
+  if (argc!=3) {
+    fprintf(stderr,"Usage: %s <kwh_so|kwh_cc> <year>\n",argv[0]);
+    return 1;
+  }
+  measure_type=argv[1];
+  if (strcmp(measure_type,"kwh_so")!=0 && strcmp(measure_type,"kwh_cc")!=0) {
+    fprintf(stderr,"Error: measure_type must be kwh_so or kwh_cc\n");
+    return 1;
+  }
+  if (!parse_year(argv[2],&target_year)) {
+    fprintf(stderr,"Error: invalid target year '%s'\n",argv[2]);
     return 1;
   }
 
-  // Google Sheets Update: 1. HOURLY TAB
-  hourly_col_idx = 2 + (target_year - base_year_h_m);
-  get_column_letter(hourly_col_idx, hourly_col_letter);
-
-  snprintf(hourly_range, sizeof(hourly_range), "%s2:%s26", hourly_col_letter, hourly_col_letter);
-
-  json_h = (char *)malloc(16384);
-  if (json_h != NULL) {
-    off = snprintf(json_h, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", hourly_tab, hourly_range);
-    for (h = 0; h < 24; h++) {
-      off += snprintf(json_h + off, 16384 - off, "[%.5f],", hourly_sum[h]);
-    }
-    snprintf(json_h + off, 16384 - off, "[%.5f]]}", hourly_total);
-
-    if (put_google_sheet_range(access_token, hourly_tab, hourly_range, json_h)) {
-      printf("Updated '%s' range %s for year %d\n", hourly_tab, hourly_range, target_year);
-    }
-    free(json_h);
+  is_so=strcmp(measure_type,"kwh_so")==0;
+  base_year_hm=is_so ? 2021 : 2024;
+  base_year_d=2025;
+  energy_table=is_so ? "energy_so" : "energy_cc";
+  if (target_year<base_year_hm) {
+    fprintf(stderr,"Error: target year %d is before base year %d\n",
+        target_year,base_year_hm);
+    return 1;
   }
 
-  // Google Sheets Update: 2. MONTHLY TAB
-  start_m_col = 2 + (target_year - base_year_h_m) * 4;
-  end_m_col = start_m_col + 3;
+  if (setenv("TZ","Europe/Rome",1)!=0) {
+    fprintf(stderr,"Error: unable to set Europe/Rome timezone\n");
+    return 1;
+  }
+  tzset();
 
-  get_column_letter(start_m_col, start_m_letter);
-  get_column_letter(end_m_col, end_m_letter);
-
-  snprintf(monthly_range, sizeof(monthly_range), "%s2:%s14", start_m_letter, end_m_letter);
-
-  json_m = (char *)malloc(32768);
-  if (json_m != NULL) {
-    off = snprintf(json_m, 32768, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", monthly_tab, monthly_range);
-    for (m = 0; m < 12; m++) {
-      off += snprintf(json_m + off, 32768 - off, "[%.5f,%.5f,%.5f,%.5f],",
-                      monthly_sum[m][0], monthly_sum[m][1],
-                      monthly_sum[m][2], monthly_sum[m][3]);
+  for (i=0;i<BOUNDARIES;i++) {
+    boundary[i]=month_boundary(target_year,i);
+    if (boundary[i]==(time_t)-1) {
+      fprintf(stderr,"Error: unable to calculate month boundary\n");
+      return 1;
     }
-    snprintf(json_m + off, 32768 - off, "[%.5f,%.5f,%.5f,%.5f]]}",
-             monthly_annual_totals[0], monthly_annual_totals[1],
-             monthly_annual_totals[2], monthly_annual_totals[3]);
-
-    if (put_google_sheet_range(access_token, monthly_tab, monthly_range, json_m)) {
-      printf("Updated '%s' range %s for year %d\n", monthly_tab, monthly_range, target_year);
-    }
-    free(json_m);
+  }
+  start_epoch=boundary[0];
+  end_epoch=boundary[12];
+  if (end_epoch<=start_epoch || (end_epoch-start_epoch)%900!=0) {
+    fprintf(stderr,"Error: invalid annual epoch range\n");
+    return 1;
+  }
+  slot_count=(size_t)((end_epoch-start_epoch)/900);
+  pun_lookup=(double *)calloc(slot_count,sizeof(double));
+  pun_valid=(unsigned char *)calloc(slot_count,sizeof(unsigned char));
+  if (pun_lookup==NULL || pun_valid==NULL) {
+    fprintf(stderr,"Error: unable to allocate PUN lookup (%lu slots)\n",
+        (unsigned long)slot_count);
+    goto cleanup;
   }
 
-  // Google Sheets Update: 3. COMPARISON TAB (d_so / d_cc)
-  if (target_year >= base_year_d) {
-    start_d_col = 2 + (target_year - base_year_d) * 5;
-    end_d_col = start_d_col + 4;
+  if (!energy_config_load(&cfg,ENERGY_CONFIG_FILE,cfg_err,sizeof(cfg_err))) {
+    fprintf(stderr,"Energy config error: %s\n",cfg_err);
+    goto cleanup;
+  }
 
-    get_column_letter(start_d_col, start_d_letter);
-    get_column_letter(end_d_col, end_d_letter);
+  conn=mysql_init(NULL);
+  if (conn==NULL) {
+    fprintf(stderr,"Error: mysql_init failed\n");
+    goto cleanup;
+  }
+  if (mysql_real_connect(conn,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
+    fprintf(stderr,"MySQL connect error: %s\n",mysql_error(conn));
+    goto cleanup;
+  }
 
-    snprintf(compare_range, sizeof(compare_range), "%s2:%s14", start_d_letter, end_d_letter);
+  if (!query_fiscal(conn,measure_type,start_epoch,end_epoch,hourly_sum,
+      monthly_sum,annual_totals,&hourly_total)) {
+    goto cleanup;
+  }
+  if (!query_pun(conn,start_epoch,end_epoch,pun_lookup,pun_valid,slot_count,
+      pun_sums,pun_counts,f_monthly,&pun_loaded)) {
+    goto cleanup;
+  }
+  if (!query_energy(conn,energy_table,start_epoch,end_epoch,boundary,
+      boundary_value,boundary_found,boundary_dist,pun_lookup,pun_valid,
+      slot_count,f_monthly,pun_counts,monthly_cp,monthly_cf,daily_cp,daily_cf,
+      &cost_intervals,&missing_pun)) {
+    goto cleanup;
+  }
 
-    json_d = (char *)malloc(16384);
-    if (json_d != NULL) {
-      off = snprintf(json_d, 16384, "{\"range\":\"%s!%s\",\"majorDimension\":\"ROWS\",\"values\":[", compare_tab, compare_range);
-      for (m = 0; m < 12; m++) {
-        off += snprintf(json_d + off, 16384 - off, "[%.5f,%.5f,%.5f,%.5f,%d],",
-                        monthly_sum[m][3], energy_monthly_sum[m],
-                        monthly_cp[m], monthly_cF[m], monthly_sup[m]);
+  for (m=0;m<MONTHS;m++) {
+    if (boundary_found[m] && boundary_found[m+1]) {
+      diff=boundary_value[m+1]-boundary_value[m];
+      if (diff>0.0) {
+        energy_monthly[m]=diff;
+        energy_annual+=diff;
       }
-      snprintf(json_d + off, 16384 - off, "[%.5f,%.5f,%.5f,%.5f,%d]]}",
-               monthly_annual_totals[3], energy_annual_total,
-               total_cp, total_cF, total_sup);
-
-      if (put_google_sheet_range(access_token, compare_tab, compare_range, json_d)) {
-        printf("Updated '%s' range %s for year %d\n", compare_tab, compare_range, target_year);
-      }
-      free(json_d);
     }
+
+    for (d=1;d<DAYS;d++) {
+      if (daily_cp[m][d]>0.0 && daily_cp[m][d]>daily_cf[m][d]) {
+        monthly_sup[m]++;
+      }
+    }
+    total_cp+=monthly_cp[m];
+    total_cf+=monthly_cf[m];
+    total_sup+=monthly_sup[m];
   }
 
+  if (conn!=NULL) {
+    mysql_close(conn);
+    conn=NULL;
+  }
+
+  snprintf(hourly_tab,sizeof(hourly_tab),"%s",is_so ? "h_so" : "h_cc");
+  snprintf(monthly_tab,sizeof(monthly_tab),"%s",is_so ? "m_so" : "m_cc");
+  snprintf(compare_tab,sizeof(compare_tab),"%s",is_so ? "d_so" : "d_cc");
+
+  hourly_col=2+(target_year-base_year_hm);
+  start_m_col=2+(target_year-base_year_hm)*4;
+  end_m_col=start_m_col+3;
+  include_compare=target_year>=base_year_d;
+  start_d_col=2+(target_year-base_year_d)*5;
+  end_d_col=start_d_col+4;
+
+  if (!get_column_letter(hourly_col,hourly_letter,sizeof(hourly_letter)) ||
+      !get_column_letter(start_m_col,start_m_letter,sizeof(start_m_letter)) ||
+      !get_column_letter(end_m_col,end_m_letter,sizeof(end_m_letter)) ||
+      (include_compare &&
+      (!get_column_letter(start_d_col,start_d_letter,sizeof(start_d_letter)) ||
+      !get_column_letter(end_d_col,end_d_letter,sizeof(end_d_letter))))) {
+    fprintf(stderr,"Error: unable to calculate Google Sheet columns\n");
+    goto cleanup;
+  }
+
+  snprintf(hourly_range,sizeof(hourly_range),"%s2:%s26",hourly_letter,hourly_letter);
+  snprintf(monthly_range,sizeof(monthly_range),"%s2:%s14",start_m_letter,end_m_letter);
+  if (include_compare) {
+    snprintf(compare_range,sizeof(compare_range),"%s2:%s14",start_d_letter,end_d_letter);
+  } else {
+    compare_range[0]='\0';
+  }
+
+  if (!read_access_token(token,sizeof(token))) {
+    goto cleanup;
+  }
+  if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) {
+    fprintf(stderr,"Error: curl_global_init failed\n");
+    goto cleanup;
+  }
+
+  if (!update_google_sheets(token,hourly_tab,hourly_range,monthly_tab,
+      monthly_range,compare_tab,compare_range,include_compare,hourly_sum,
+      hourly_total,monthly_sum,annual_totals,energy_monthly,energy_annual,
+      monthly_cp,monthly_cf,monthly_sup,total_cp,total_cf,total_sup)) {
+    curl_global_cleanup();
+    goto cleanup;
+  }
   curl_global_cleanup();
-  return 0;
+
+  printf("Updated '%s' range %s for year %d\n",hourly_tab,hourly_range,target_year);
+  printf("Updated '%s' range %s for year %d\n",monthly_tab,monthly_range,target_year);
+  if (include_compare) {
+    printf("Updated '%s' range %s for year %d\n",compare_tab,compare_range,target_year);
+  }
+  printf("PUN: %lu slots loaded, %lu cost intervals used, %lu intervals skipped for missing PUN\n",
+      pun_loaded,cost_intervals,missing_pun);
+  status=0;
+
+cleanup:
+  if (conn!=NULL) {
+    mysql_close(conn);
+  }
+  free(pun_lookup);
+  free(pun_valid);
+  return status;
 }

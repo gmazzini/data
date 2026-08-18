@@ -1,970 +1,911 @@
-// Gianluca Mazzini @2026 - Version 1.20
-// Writes PUN monthly results and daily 3-hour minimum window to Google Sheets
-// Correctly parses sheet IDs for both 'pun' and 'h' tabs
-// Sorts sheets ascending before update and descending after update
-// Accepts input parameter in format YYYYMMDD (e.g. 20260810)
+// Gianluca Mazzini @2026- Version 1.22
+// Processes PUN 15-minute prices and updates monthly and daily Google Sheets results
 
+#include <ctype.h>
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
-#include <float.h>
 #include <curl/curl.h>
 #include <mysql/mysql.h>
-#include "/home/tools/setup_energy.c"
+#include "energy_config.h"
 
-// Path to Google OAuth2 token file
 #define TOKEN_FILE "/home/www/data/google_access_token"
-
-// Google Spreadsheet ID and Tab names
 #define SPREADSHEET_ID "1RF4N-T2NR2UHai70AzTzwuLXowkLlOQWvFyb8AaE1xg"
 #define SHEET_NAME_PUN "pun"
 #define SHEET_NAME_H "h"
-
-// Max 15-minute intervals in a month and 3-hour window slots
-#define MAX_RECORDS 3500
+#define BASE_DATE "20251001"
 #define WINDOW_SLOTS 12
+#define DAY_SLOTS_MAX 100
+#define HTTP_BUFFER_START 4096
+#define TOKEN_SIZE 4096
+#define AUTH_HEADER_SIZE 4352
+#define URL_SIZE 768
+#define JSON_SIZE 4096
+#define QUERY_SIZE 512
+#define MIN_EPSILON 0.00001
 
-// Structure to store individual 15-minute records
-typedef struct {
-  time_t epoch;
-  double price;
-  int day;
-  int month;
-  int year;
-  int band;
-} Record;
-
-// Struct for HTTP response body buffer
 struct mem {
   char *ptr;
   size_t len;
+  size_t cap;
 };
 
-// Initialize memory buffer
-static void mem_init(struct mem *m) {
-  m->len = 0;
-  m->ptr = (char *)malloc(1);
-  if (m->ptr != NULL) {
-    m->ptr[0] = '\0';
+static int mem_init(struct mem *m) {
+  m->ptr=(char *)malloc(HTTP_BUFFER_START);
+  m->len=0;
+  m->cap=0;
+
+  if (m->ptr==NULL) {
+    return 0;
+  }
+  m->cap=HTTP_BUFFER_START;
+  m->ptr[0]='\0';
+  return 1;
+}
+
+static void mem_reset(struct mem *m) {
+  m->len=0;
+  if (m->ptr!=NULL) {
+    m->ptr[0]='\0';
   }
 }
 
-// Curl write callback to accumulate HTTP response body
+static void mem_free(struct mem *m) {
+  free(m->ptr);
+  m->ptr=NULL;
+  m->len=0;
+  m->cap=0;
+}
+
 static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
   struct mem *m;
   char *p;
-  size_t realsize;
+  size_t real_size, needed, new_cap;
 
-  m = NULL;
-  p = NULL;
-  realsize = 0;
-
-  realsize = size * nmemb;
-  m = (struct mem *)userp;
-  p = (char *)realloc(m->ptr, m->len + realsize + 1);
-
-  if (p == NULL) {
+  m=(struct mem *)userp;
+  if (nmemb!=0 && size>((size_t)-1)/nmemb) {
     return 0;
   }
-
-  m->ptr = p;
-  memcpy(&(m->ptr[m->len]), contents, realsize);
-  m->len += realsize;
-  m->ptr[m->len] = '\0';
-
-  return realsize;
-}
-
-// Read access token from local file
-static int read_access_token(char *buf, size_t buflen) {
-  FILE *fp;
-
-  fp = NULL;
-
-  fp = fopen(TOKEN_FILE, "r");
-  if (fp == NULL) {
-    fprintf(stderr, "Error: unable to open %s\n", TOKEN_FILE);
+  real_size=size*nmemb;
+  if (real_size>((size_t)-1)-m->len-1) {
     return 0;
   }
+  needed=m->len+real_size+1;
 
-  if (fgets(buf, (int)buflen, fp) == NULL) {
-    fclose(fp);
-    fprintf(stderr, "Error: unable to read access token\n");
-    return 0;
-  }
-
-  fclose(fp);
-  buf[strcspn(buf, "\r\n")] = '\0';
-
-  if (buf[0] == '\0') {
-    fprintf(stderr, "Error: empty access token\n");
-    return 0;
-  }
-
-  return 1;
-}
-
-// Dynamically resolve numeric sheetId from sheet title (e.g. "pun" or "h")
-static int get_sheet_id_by_name(const char *token, const char *sheet_name) {
-  CURL *curl;
-  struct curl_slist *headers;
-  struct mem body;
-  CURLcode res;
-  long http_code;
-  char url[512], auth_header[1024], search_str[128];
-  char *p_title, *search_ptr, *last_id_ptr, *next_id_ptr;
-  int sheet_id;
-
-  curl = NULL;
-  headers = NULL;
-  body.ptr = NULL;
-  body.len = 0;
-  res = CURLE_OK;
-  http_code = 0;
-  sheet_id = -1;
-  p_title = NULL;
-  search_ptr = NULL;
-  last_id_ptr = NULL;
-  next_id_ptr = NULL;
-
-  snprintf(url, sizeof(url),
-    "https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties(sheetId,title)",
-    SPREADSHEET_ID);
-
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-
-  mem_init(&body);
-
-  curl = curl_easy_init();
-  if (curl == NULL) {
-    free(body.ptr);
-    return -1;
-  }
-
-  headers = curl_slist_append(headers, auth_header);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-
-  res = curl_easy_perform(curl);
-  if (res != CURLE_OK) {
-    fprintf(stderr, "Google Sheets API (get_sheet_id) curl error: %s\n", curl_easy_strerror(res));
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
-    return -1;
-  }
-
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API (get_sheet_id) HTTP %ld\n", http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
-    return -1;
-  }
-
-  snprintf(search_str, sizeof(search_str), "\"title\": \"%s\"", sheet_name);
-  p_title = strstr(body.ptr, search_str);
-  if (p_title == NULL) {
-    snprintf(search_str, sizeof(search_str), "\"title\":\"%s\"", sheet_name);
-    p_title = strstr(body.ptr, search_str);
-  }
-
-  if (p_title != NULL) {
-    search_ptr = body.ptr;
-    while (search_ptr != NULL && search_ptr < p_title) {
-      next_id_ptr = strstr(search_ptr, "\"sheetId\":");
-      if (next_id_ptr != NULL && next_id_ptr < p_title) {
-        last_id_ptr = next_id_ptr;
-        search_ptr = next_id_ptr + 10;
-      } else {
+  if (needed>m->cap) {
+    new_cap=m->cap;
+    for (;new_cap<needed;) {
+      if (new_cap>((size_t)-1)/2) {
+        new_cap=needed;
         break;
       }
+      new_cap*=2;
     }
-
-    if (last_id_ptr != NULL) {
-      if (sscanf(last_id_ptr, "\"sheetId\": %d", &sheet_id) != 1) {
-        sscanf(last_id_ptr, "\"sheetId\":%d", &sheet_id);
-      }
+    p=(char *)realloc(m->ptr,new_cap);
+    if (p==NULL) {
+      return 0;
     }
+    m->ptr=p;
+    m->cap=new_cap;
   }
 
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  free(body.ptr);
-
-  if (sheet_id == -1) {
-    fprintf(stderr, "Error: sheet name '%s' not found in spreadsheet\n", sheet_name);
-  }
-
-  return sheet_id;
+  memcpy(m->ptr+m->len,contents,real_size);
+  m->len+=real_size;
+  m->ptr[m->len]='\0';
+  return real_size;
 }
 
-// Sort range in Google Sheet using batchUpdate API
-static int sort_google_sheet_range(const char *token, int sheet_id,
-                                   int num_cols, int ascending) {
-  CURL *curl;
-  struct curl_slist *headers;
-  struct mem body;
-  CURLcode res;
-  long http_code;
-  char url[512], json_payload[1024], auth_header[1024];
+static int read_access_token(char *buf, size_t cap) {
+  FILE *fp;
 
-  curl = NULL;
-  headers = NULL;
-  body.ptr = NULL;
-  body.len = 0;
-  res = CURLE_OK;
-  http_code = 0;
-
-  snprintf(url, sizeof(url),
-    "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
-    SPREADSHEET_ID);
-
-  snprintf(json_payload, sizeof(json_payload),
-    "{"
-    "\"requests\":[{"
-      "\"sortRange\":{"
-        "\"range\":{"
-          "\"sheetId\":%d,"
-          "\"startRowIndex\":1,"
-          "\"startColumnIndex\":0,"
-          "\"endColumnIndex\":%d"
-        "},"
-        "\"sortSpecs\":[{"
-          "\"dimensionIndex\":0,"
-          "\"sortOrder\":\"%s\""
-        "}]"
-      "}"
-    "}]"
-    "}",
-    sheet_id, num_cols, ascending ? "ASCENDING" : "DESCENDING");
-
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-
-  mem_init(&body);
-
-  curl = curl_easy_init();
-  if (curl == NULL) {
-    free(body.ptr);
+  fp=fopen(TOKEN_FILE,"r");
+  if (fp==NULL) {
+    fprintf(stderr,"Error: unable to open %s\n",TOKEN_FILE);
     return 0;
   }
-
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, auth_header);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POST, 1L);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
-
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-
-  res = curl_easy_perform(curl);
-  if (res != CURLE_OK) {
-    fprintf(stderr, "Google Sheets API (sort) curl error: %s\n", curl_easy_strerror(res));
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  if (fgets(buf,(int)cap,fp)==NULL) {
+    fclose(fp);
+    fprintf(stderr,"Error: unable to read access token\n");
     return 0;
   }
+  fclose(fp);
 
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API (sort) HTTP %ld\n", http_code);
-    fprintf(stderr, "Google response: %s\n", body.ptr ? body.ptr : "(null)");
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  buf[strcspn(buf,"\r\n")]='\0';
+  if (*buf=='\0') {
+    fprintf(stderr,"Error: empty access token\n");
     return 0;
   }
-
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  free(body.ptr);
   return 1;
 }
 
-// Calculate Easter Monday date for a given year using Anonymous Gauss algorithm
-static void get_easter_monday(int year, int *out_m, int *out_d) {
-  int a, b, c, d, e, f, g, h, i, k, l, m;
-  int month_e, day_e;
+static int http_request(CURL *curl, const char *method, const char *url,
+    struct curl_slist *headers, const char *payload, struct mem *body) {
+  CURLcode rc;
+  long status;
+  size_t len;
 
-  a = 0; b = 0; c = 0; d = 0; e = 0; f = 0;
-  g = 0; h = 0; i = 0; k = 0; l = 0; m = 0;
-  month_e = 0;
-  day_e = 0;
+  mem_reset(body);
+  curl_easy_reset(curl);
+  curl_easy_setopt(curl,CURLOPT_URL,url);
+  curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
+  curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,write_cb);
+  curl_easy_setopt(curl,CURLOPT_WRITEDATA,body);
+  curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);
+  curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,2L);
+  curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT,15L);
+  curl_easy_setopt(curl,CURLOPT_TIMEOUT,60L);
+  curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
+  curl_easy_setopt(curl,CURLOPT_USERAGENT,"pun/1.21");
 
-  a = year % 19;
-  b = year / 100;
-  c = year % 100;
-  d = b / 4;
-  e = b % 4;
-  f = (b + 8) / 25;
-  g = (b - f + 1) / 3;
-  h = (19 * a + b - d - g + 15) % 30;
-  i = c / 4;
-  k = c % 4;
-  l = (32 + 2 * e + 2 * i - h - k) % 7;
-  m = (a + 11 * h + 22 * l) / 451;
-  month_e = (h + l - 7 * m + 114) / 31;
-  day_e = ((h + l - 7 * m + 114) % 31) + 1;
-
-  if (month_e == 3) {
-    if (day_e < 31) {
-      *out_m = 3;
-      *out_d = day_e + 1;
-    } else {
-      *out_m = 4;
-      *out_d = 1;
+  if (strcmp(method,"GET")==0) {
+    curl_easy_setopt(curl,CURLOPT_HTTPGET,1L);
+  } else if (strcmp(method,"POST")==0) {
+    if (payload==NULL) {
+      fprintf(stderr,"Error: missing HTTP payload\n");
+      return 0;
     }
+    len=strlen(payload);
+    if (len>(size_t)LONG_MAX) {
+      fprintf(stderr,"Error: HTTP payload too large\n");
+      return 0;
+    }
+    curl_easy_setopt(curl,CURLOPT_POST,1L);
+    curl_easy_setopt(curl,CURLOPT_POSTFIELDS,payload);
+    curl_easy_setopt(curl,CURLOPT_POSTFIELDSIZE,(long)len);
   } else {
-    *out_m = 4;
-    *out_d = day_e + 1;
+    fprintf(stderr,"Error: unsupported HTTP method\n");
+    return 0;
+  }
+
+  rc=curl_easy_perform(curl);
+  if (rc!=CURLE_OK) {
+    fprintf(stderr,"Google Sheets curl error: %s\n",curl_easy_strerror(rc));
+    return 0;
+  }
+
+  status=0;
+  if (curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&status)!=CURLE_OK) {
+    fprintf(stderr,"Error: unable to read HTTP status\n");
+    return 0;
+  }
+  if (status<200 || status>=300) {
+    fprintf(stderr,"Google Sheets HTTP %ld: %.1000s\n",status,
+        body->ptr!=NULL ? body->ptr : "");
+    return 0;
+  }
+  return 1;
+}
+
+static int json_key_string(const char *p, const char *key, const char **value,
+    size_t *len) {
+  const char *q, *e;
+  char pattern[64];
+  int n;
+
+  n=snprintf(pattern,sizeof(pattern),"\"%s\"",key);
+  if (n<0 || n>=(int)sizeof(pattern)) {
+    return 0;
+  }
+  q=strstr(p,pattern);
+  if (q==NULL) {
+    return 0;
+  }
+  q+=strlen(pattern);
+  for (;*q!='\0' && isspace((unsigned char)*q);q++) {
+  }
+  if (*q!=':') {
+    return 0;
+  }
+  q++;
+  for (;*q!='\0' && isspace((unsigned char)*q);q++) {
+  }
+  if (*q!='\"') {
+    return 0;
+  }
+  q++;
+  e=strchr(q,'\"');
+  if (e==NULL) {
+    return 0;
+  }
+
+  *value=q;
+  *len=(size_t)(e-q);
+  return 1;
+}
+
+static int find_sheet_id(const char *json, const char *title) {
+  const char *p, *value, *scan, *last, *colon, *endptr;
+  size_t len;
+  long id;
+
+  p=json;
+  for (;json_key_string(p,"title",&value,&len);p=value+len+1) {
+    if (strlen(title)!=len || strncmp(value,title,len)!=0) {
+      continue;
+    }
+
+    scan=json;
+    last=NULL;
+    for (;scan<value;) {
+      scan=strstr(scan,"\"sheetId\"");
+      if (scan==NULL || scan>=value) {
+        break;
+      }
+      last=scan;
+      scan+=9;
+    }
+    if (last==NULL) {
+      return -1;
+    }
+
+    colon=strchr(last,':');
+    if (colon==NULL || colon>=value) {
+      return -1;
+    }
+    colon++;
+    for (;colon<value && isspace((unsigned char)*colon);colon++) {
+    }
+    errno=0;
+    id=strtol(colon,(char **)&endptr,10);
+    if (errno!=0 || endptr==colon || id<0 || id>INT_MAX) {
+      return -1;
+    }
+    return (int)id;
+  }
+  return -1;
+}
+
+static int get_sheet_ids(CURL *curl, struct curl_slist *headers,
+    struct mem *body, int *pun_id, int *h_id) {
+  char url[URL_SIZE];
+  int n;
+
+  n=snprintf(url,sizeof(url),
+      "https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties(sheetId,title)",
+      SPREADSHEET_ID);
+  if (n<0 || n>=(int)sizeof(url)) {
+    return 0;
+  }
+  if (!http_request(curl,"GET",url,headers,NULL,body)) {
+    return 0;
+  }
+
+  *pun_id=find_sheet_id(body->ptr,SHEET_NAME_PUN);
+  *h_id=find_sheet_id(body->ptr,SHEET_NAME_H);
+  if (*pun_id<0 || *h_id<0) {
+    fprintf(stderr,"Error: unable to resolve sheet IDs for '%s' and '%s'\n",
+        SHEET_NAME_PUN,SHEET_NAME_H);
+    return 0;
+  }
+  return 1;
+}
+
+static int sort_google_sheets(CURL *curl, struct curl_slist *headers,
+    struct mem *body, int pun_id, int h_id, int ascending) {
+  char url[URL_SIZE], json[JSON_SIZE];
+  const char *order;
+  int n;
+
+  order=ascending ? "ASCENDING" : "DESCENDING";
+  n=snprintf(url,sizeof(url),
+      "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
+      SPREADSHEET_ID);
+  if (n<0 || n>=(int)sizeof(url)) {
+    return 0;
+  }
+
+  n=snprintf(json,sizeof(json),
+      "{\"requests\":["
+      "{\"sortRange\":{\"range\":{\"sheetId\":%d,\"startRowIndex\":1,"
+      "\"startColumnIndex\":0,\"endColumnIndex\":10},"
+      "\"sortSpecs\":[{\"dimensionIndex\":0,\"sortOrder\":\"%s\"}]}},"
+      "{\"sortRange\":{\"range\":{\"sheetId\":%d,\"startRowIndex\":1,"
+      "\"startColumnIndex\":0,\"endColumnIndex\":3},"
+      "\"sortSpecs\":[{\"dimensionIndex\":0,\"sortOrder\":\"%s\"}]}}]}",
+      pun_id,order,h_id,order);
+  if (n<0 || n>=(int)sizeof(json)) {
+    fprintf(stderr,"Error: sort JSON buffer too small\n");
+    return 0;
+  }
+
+  return http_request(curl,"POST",url,headers,json,body);
+}
+
+static int update_google_sheets(CURL *curl, struct curl_slist *headers,
+    struct mem *body, int row_pun, int row_h, const char *aaaamm,
+    double f0, double f1, double f2, double f3, double min_val,
+    double max_val, const char *bestday, const char *worstday,
+    const char *minday, const char *date_str, const char *time_str,
+    double avg_3h) {
+  char url[URL_SIZE], json[JSON_SIZE];
+  int n;
+
+  n=snprintf(url,sizeof(url),
+      "https://sheets.googleapis.com/v4/spreadsheets/%s/values:batchUpdate",
+      SPREADSHEET_ID);
+  if (n<0 || n>=(int)sizeof(url)) {
+    return 0;
+  }
+
+  n=snprintf(json,sizeof(json),
+      "{\"valueInputOption\":\"USER_ENTERED\",\"data\":["
+      "{\"range\":\"%s!A%d:J%d\",\"majorDimension\":\"ROWS\","
+      "\"values\":[[\"%s\",%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
+      "\"%s\",\"%s\",\"%s\"]]},"
+      "{\"range\":\"%s!A%d:C%d\",\"majorDimension\":\"ROWS\","
+      "\"values\":[[\"%s\",\"%s\",%.5f]]}]}",
+      SHEET_NAME_PUN,row_pun,row_pun,aaaamm,f0,f1,f2,f3,min_val,max_val,
+      bestday,worstday,minday,SHEET_NAME_H,row_h,row_h,date_str,time_str,avg_3h);
+  if (n<0 || n>=(int)sizeof(json)) {
+    fprintf(stderr,"Error: values JSON buffer too small\n");
+    return 0;
+  }
+
+  return http_request(curl,"POST",url,headers,json,body);
+}
+
+static void get_easter_monday(int year, int *out_m, int *out_d) {
+  int a, b, c, d, e, f, g, h, i, k, l, m, month_e, day_e;
+
+  a=year%19;
+  b=year/100;
+  c=year%100;
+  d=b/4;
+  e=b%4;
+  f=(b+8)/25;
+  g=(b-f+1)/3;
+  h=(19*a+b-d-g+15)%30;
+  i=c/4;
+  k=c%4;
+  l=(32+2*e+2*i-h-k)%7;
+  m=(a+11*h+22*l)/451;
+  month_e=(h+l-7*m+114)/31;
+  day_e=((h+l-7*m+114)%31)+1;
+
+  if (month_e==3 && day_e==31) {
+    *out_m=4;
+    *out_d=1;
+  } else {
+    *out_m=month_e;
+    *out_d=day_e+1;
   }
 }
 
-// Check if a date is an Italian national holiday
-static int is_festivo(struct tm *tm) {
-  int m, d, y;
-  int em_m, em_d;
+static int is_festivo(const struct tm *tm) {
+  int m, d, y, em_m, em_d;
 
-  m = 0;
-  d = 0;
-  y = 0;
-  em_m = 0;
-  em_d = 0;
-
-  m = tm->tm_mon + 1;
-  d = tm->tm_mday;
-  y = tm->tm_year + 1900;
-
-  if ((m == 1 && d == 1) || (m == 1 && d == 6) ||
-      (m == 4 && d == 25) || (m == 5 && d == 1) ||
-      (m == 6 && d == 2) || (m == 8 && d == 15) ||
-      (m == 11 && d == 1) || (m == 12 && d == 8) ||
-      (m == 12 && d == 25) || (m == 12 && d == 26)) {
+  m=tm->tm_mon+1;
+  d=tm->tm_mday;
+  y=tm->tm_year+1900;
+  if ((m==1 && d==1) || (m==1 && d==6) || (m==4 && d==25) ||
+      (m==5 && d==1) || (m==6 && d==2) || (m==8 && d==15) ||
+      (m==11 && d==1) || (m==12 && d==8) || (m==12 && d==25) ||
+      (m==12 && d==26)) {
     return 1;
   }
 
-  get_easter_monday(y, &em_m, &em_d);
-  if (m == em_m && d == em_d) {
-    return 1;
-  }
-
-  return 0;
+  get_easter_monday(y,&em_m,&em_d);
+  return m==em_m && d==em_d;
 }
 
-// Determine ARERA energy band index (1 = F1, 2 = F2, 3 = F3)
-static int get_band_index(struct tm *tm) {
+static int get_band_index(const struct tm *tm) {
   int dow, h;
 
-  dow = 0;
-  h = 0;
-
-  dow = tm->tm_wday;
-  h = tm->tm_hour;
-
-  if (dow == 0 || is_festivo(tm)) {
+  dow=tm->tm_wday;
+  h=tm->tm_hour;
+  if (dow==0 || is_festivo(tm)) {
     return 3;
   }
-
-  if (dow == 6) {
-    return (h >= 7 && h < 23) ? 2 : 3;
+  if (dow==6) {
+    return h>=7 && h<23 ? 2 : 3;
   }
-
-  if (h >= 8 && h < 19) {
+  if (h>=8 && h<19) {
     return 1;
   }
-
-  if ((h >= 7 && h < 8) || (h >= 19 && h < 23)) {
+  if ((h>=7 && h<8) || (h>=19 && h<23)) {
     return 2;
   }
-
   return 3;
 }
 
-// Update Google Sheet row for monthly tab "pun" (Columns A to J)
-static int update_google_sheet_pun(const char *token, const char *aaaamm, int row_index,
-                                    double f0, double f1, double f2, double f3,
-                                    double min_val, double max_val,
-                                    const char *bestday, const char *worstday, const char *minday) {
-  CURL *curl;
-  struct curl_slist *headers;
-  struct mem body;
-  CURLcode res;
-  long http_code;
-  char url[512], json_payload[1024], auth_header[1024];
+static int parse_date(const char *text, int *year, int *month, int *day,
+    time_t *noon_epoch) {
+  struct tm t;
+  struct tm *check;
+  time_t value;
+  int i;
 
-  curl = NULL;
-  headers = NULL;
-  body.ptr = NULL;
-  body.len = 0;
-  res = CURLE_OK;
-  http_code = 0;
-
-  snprintf(url, sizeof(url),
-    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:J%d?valueInputOption=USER_ENTERED",
-    SPREADSHEET_ID, SHEET_NAME_PUN, row_index, row_index);
-
-  snprintf(json_payload, sizeof(json_payload),
-    "{"
-    "\"range\":\"%s!A%d:J%d\","
-    "\"majorDimension\":\"ROWS\","
-    "\"values\":[["
-    "\"%s\",%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,\"%s\",\"%s\",\"%s\""
-    "]]"
-    "}",
-    SHEET_NAME_PUN, row_index, row_index,
-    aaaamm, f0, f1, f2, f3, min_val, max_val, bestday, worstday, minday);
-
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-
-  mem_init(&body);
-
-  curl = curl_easy_init();
-  if (curl == NULL) {
-    free(body.ptr);
+  if (strlen(text)!=8) {
+    return 0;
+  }
+  for (i=0;i<8;i++) {
+    if (!isdigit((unsigned char)text[i])) {
+      return 0;
+    }
+  }
+  if (sscanf(text,"%4d%2d%2d",year,month,day)!=3) {
     return 0;
   }
 
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, auth_header);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
-
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-
-  res = curl_easy_perform(curl);
-  if (res != CURLE_OK) {
-    fprintf(stderr, "Google Sheets API (tab pun) curl error: %s\n", curl_easy_strerror(res));
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  memset(&t,0,sizeof(t));
+  t.tm_year=*year-1900;
+  t.tm_mon=*month-1;
+  t.tm_mday=*day;
+  t.tm_hour=12;
+  t.tm_isdst=-1;
+  value=mktime(&t);
+  if (value==(time_t)-1) {
     return 0;
   }
 
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API (tab pun) HTTP %ld\n", http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  check=localtime(&value);
+  if (check==NULL || check->tm_year!=*year-1900 || check->tm_mon!=*month-1 ||
+      check->tm_mday!=*day || check->tm_hour!=12) {
     return 0;
   }
 
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  free(body.ptr);
+  *noon_epoch=value;
   return 1;
 }
 
-// Update Google Sheet row for daily window tab "h" (Columns A to C)
-static int update_google_sheet_h(const char *token, int row_index,
-                                 const char *date_str, const char *time_str,
-                                 double avg_3h) {
-  CURL *curl;
-  struct curl_slist *headers;
-  struct mem body;
-  CURLcode res;
-  long http_code;
-  char url[512], json_payload[512], auth_header[1024];
+static int month_range(int year, int month, time_t *start, time_t *end) {
+  struct tm t;
+  time_t first, next;
 
-  curl = NULL;
-  headers = NULL;
-  body.ptr = NULL;
-  body.len = 0;
-  res = CURLE_OK;
-  http_code = 0;
-
-  snprintf(url, sizeof(url),
-    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:C%d?valueInputOption=USER_ENTERED",
-    SPREADSHEET_ID, SHEET_NAME_H, row_index, row_index);
-
-  snprintf(json_payload, sizeof(json_payload),
-    "{"
-    "\"range\":\"%s!A%d:C%d\","
-    "\"majorDimension\":\"ROWS\","
-    "\"values\":[["
-    "\"%s\",\"%s\",%.5f"
-    "]]"
-    "}",
-    SHEET_NAME_H, row_index, row_index,
-    date_str, time_str, avg_3h);
-
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-
-  mem_init(&body);
-
-  curl = curl_easy_init();
-  if (curl == NULL) {
-    free(body.ptr);
+  memset(&t,0,sizeof(t));
+  t.tm_year=year-1900;
+  t.tm_mon=month-1;
+  t.tm_mday=1;
+  t.tm_isdst=-1;
+  first=mktime(&t);
+  if (first==(time_t)-1) {
     return 0;
   }
 
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, auth_header);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
-
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-
-  res = curl_easy_perform(curl);
-  if (res != CURLE_OK) {
-    fprintf(stderr, "Google Sheets API (tab h) curl error: %s\n", curl_easy_strerror(res));
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  t.tm_mon++;
+  t.tm_isdst=-1;
+  next=mktime(&t);
+  if (next==(time_t)-1 || next<=first) {
     return 0;
   }
 
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    fprintf(stderr, "Google Sheets API (tab h) HTTP %ld\n", http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body.ptr);
+  *start=first;
+  *end=next-1;
+  return 1;
+}
+
+static int parse_db_epoch(const char *text, time_t *value) {
+  char *end;
+  long long n;
+
+  errno=0;
+  n=strtoll(text,&end,10);
+  if (errno!=0 || end==text || *end!='\0') {
     return 0;
   }
+  *value=(time_t)n;
+  return (long long)*value==n;
+}
 
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  free(body.ptr);
+static int parse_db_double(const char *text, double *value) {
+  char *end;
+
+  errno=0;
+  *value=strtod(text,&end);
+  return errno==0 && end!=text && *end=='\0';
+}
+
+static int find_min_window(const double *prices, const time_t *epochs, int count,
+    int *best_index, double *best_avg) {
+  double sum, min_sum;
+  int i, k, valid, found;
+
+  min_sum=DBL_MAX;
+  *best_index=-1;
+  found=0;
+
+  for (i=0;i<=count-WINDOW_SLOTS;i++) {
+    sum=prices[i];
+    valid=1;
+    for (k=1;k<WINDOW_SLOTS;k++) {
+      if (epochs[i+k]!=epochs[i+k-1]+900) {
+        valid=0;
+        break;
+      }
+      sum+=prices[i+k];
+    }
+    if (valid && (!found || sum<min_sum)) {
+      min_sum=sum;
+      *best_index=i;
+      found=1;
+    }
+  }
+
+  if (!found) {
+    return 0;
+  }
+  *best_avg=min_sum/(double)WINDOW_SLOTS;
   return 1;
 }
 
 int main(int argc, char *argv[]) {
   MYSQL *conn;
+  EnergyConfig cfg;
+  char cfg_err[256];
   MYSQL_RES *result;
   MYSQL_ROW row;
-  static Record records[MAX_RECORDS];
-  struct tm start_tm, next_tm, local_tm, base_tm, target_tm;
-  time_t sds, sde, t_val, base_epoch, target_epoch, day_epochs[96];
-  double sums[4], day_sums[32], day_prices[96];
-  double global_min, global_max, f0, f1, f2, f3;
-  double min_day_avg, max_day_avg, avg, c_val;
-  double window_sum, min_window_sum, min_window_avg;
+  CURL *curl;
+  struct curl_slist *headers, *tmp_headers;
+  struct mem body;
+  struct tm base_tm, local_tm;
+  struct tm *local_ptr;
+  time_t sds, sde, target_noon, base_noon, t_val, prev_min_epoch;
+  time_t day_epochs[DAY_SLOTS_MAX];
+  double sums[4], day_sums[32], day_prices[DAY_SLOTS_MAX];
+  double global_min, global_max, f0, f1, f2, f3, c_val;
+  double min_day_avg, max_day_avg, avg, min_window_avg;
   long counts[4], day_counts[32];
-  long long epoch_val;
+  int max_min_run[32];
   int year, month, day, delta_months, days_diff;
-  int row_index_pun, row_index_h, total_records, day_records_count;
-  int best_day, worst_day, min_day, max_consec_run, current_run, max_run;
-  int band, d, i, k, best_window_idx;
-  int sheet_id_pun, sheet_id_h;
-  int max_consecutive_per_day[32];
-  char query[512], access_token[512], aaaamm[8];
-  char bestday_str[16], worstday_str[16], minday_str[16];
+  int row_pun, row_h, day_count, best_day, worst_day, min_day;
+  int max_run, run_len, run_day, band, d, best_window_idx;
+  int sheet_id_pun, sheet_id_h, sorted_ascending, status;
+  char query[QUERY_SIZE], token[TOKEN_SIZE], auth_header[AUTH_HEADER_SIZE];
+  char aaaamm[8], bestday[16], worstday[16], minday[16];
   char date_str[16], time_str[16];
+  int n;
 
-  conn = NULL;
-  result = NULL;
-  row = NULL;
-  sds = 0;
-  sde = 0;
-  t_val = 0;
-  base_epoch = 0;
-  target_epoch = 0;
-  global_min = DBL_MAX;
-  global_max = -DBL_MAX;
-  f0 = 0.0;
-  f1 = 0.0;
-  f2 = 0.0;
-  f3 = 0.0;
-  min_day_avg = DBL_MAX;
-  max_day_avg = -DBL_MAX;
-  avg = 0.0;
-  c_val = 0.0;
-  window_sum = 0.0;
-  min_window_sum = DBL_MAX;
-  min_window_avg = 0.0;
-  epoch_val = 0;
-  year = 0;
-  month = 0;
-  day = 0;
-  delta_months = 0;
-  days_diff = 0;
-  row_index_pun = 0;
-  row_index_h = 0;
-  total_records = 0;
-  day_records_count = 0;
-  best_day = 1;
-  worst_day = 1;
-  min_day = 1;
-  max_consec_run = -1;
-  current_run = 0;
-  max_run = 0;
-  band = 0;
-  d = 0;
-  i = 0;
-  k = 0;
-  best_window_idx = 0;
-  sheet_id_pun = -1;
-  sheet_id_h = -1;
+  conn=NULL;
+  result=NULL;
+  row=NULL;
+  curl=NULL;
+  headers=NULL;
+  tmp_headers=NULL;
+  body.ptr=NULL;
+  body.len=0;
+  body.cap=0;
+  memset(&base_tm,0,sizeof(base_tm));
+  memset(&local_tm,0,sizeof(local_tm));
+  sds=0;
+  sde=0;
+  target_noon=0;
+  base_noon=0;
+  prev_min_epoch=0;
+  memset(day_epochs,0,sizeof(day_epochs));
+  memset(sums,0,sizeof(sums));
+  memset(day_sums,0,sizeof(day_sums));
+  memset(day_prices,0,sizeof(day_prices));
+  memset(counts,0,sizeof(counts));
+  memset(day_counts,0,sizeof(day_counts));
+  memset(max_min_run,0,sizeof(max_min_run));
+  global_min=DBL_MAX;
+  global_max=-DBL_MAX;
+  f0=0.0;
+  f1=0.0;
+  f2=0.0;
+  f3=0.0;
+  min_day_avg=DBL_MAX;
+  max_day_avg=-DBL_MAX;
+  min_window_avg=0.0;
+  year=0;
+  month=0;
+  day=0;
+  delta_months=0;
+  days_diff=0;
+  row_pun=0;
+  row_h=0;
+  day_count=0;
+  best_day=0;
+  worst_day=0;
+  min_day=0;
+  max_run=-1;
+  run_len=0;
+  run_day=0;
+  best_window_idx=-1;
+  sheet_id_pun=-1;
+  sheet_id_h=-1;
+  sorted_ascending=0;
+  status=1;
 
-  memset(&start_tm, 0, sizeof(struct tm));
-  memset(&next_tm, 0, sizeof(struct tm));
-  memset(&local_tm, 0, sizeof(struct tm));
-  memset(&base_tm, 0, sizeof(struct tm));
-  memset(&target_tm, 0, sizeof(struct tm));
-  memset(sums, 0, sizeof(sums));
-  memset(day_sums, 0, sizeof(day_sums));
-  memset(day_prices, 0, sizeof(day_prices));
-  memset(day_epochs, 0, sizeof(day_epochs));
-  memset(counts, 0, sizeof(counts));
-  memset(day_counts, 0, sizeof(day_counts));
-  memset(max_consecutive_per_day, 0, sizeof(max_consecutive_per_day));
-  memset(query, 0, sizeof(query));
-  memset(access_token, 0, sizeof(access_token));
-  memset(aaaamm, 0, sizeof(aaaamm));
-  memset(bestday_str, 0, sizeof(bestday_str));
-  memset(worstday_str, 0, sizeof(worstday_str));
-  memset(minday_str, 0, sizeof(minday_str));
-  memset(date_str, 0, sizeof(date_str));
-  memset(time_str, 0, sizeof(time_str));
-
-  if (argc != 2) {
-    fprintf(stderr, "Usage: %s YYYYMMDD\n", argv[0]);
-    fprintf(stderr, "Example: %s 20260810\n", argv[0]);
+  if (argc!=2) {
+    fprintf(stderr,"Usage: %s YYYYMMDD\n",argv[0]);
+    fprintf(stderr,"Example: %s 20260810\n",argv[0]);
     return 1;
   }
 
-  if (strlen(argv[1]) != 8) {
-    fprintf(stderr, "Error: parameter must be 8 digits (YYYYMMDD)\n");
+  if (setenv("TZ","Europe/Rome",1)!=0) {
+    fprintf(stderr,"Error: unable to set Europe/Rome timezone\n");
     return 1;
   }
-
-  if (sscanf(argv[1], "%4d%2d%2d", &year, &month, &day) != 3 ||
-      month < 1 || month > 12 || day < 1 || day > 31) {
-    fprintf(stderr, "Error: invalid year, month or day in %s\n", argv[1]);
-    return 1;
-  }
-
-  snprintf(aaaamm, sizeof(aaaamm), "%04d%02d", year, month);
-  snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d", year, month, day);
-
-  delta_months = (year - 2025) * 12 + (month - 10);
-  row_index_pun = 2 + delta_months;
-
-  if (row_index_pun < 2) {
-    fprintf(stderr, "Error: Date %s is before base date 20251001\n", argv[1]);
-    return 1;
-  }
-
-  base_tm.tm_year = 2025 - 1900;
-  base_tm.tm_mon = 10 - 1;
-  base_tm.tm_mday = 1;
-  base_tm.tm_hour = 12;
-  base_tm.tm_min = 0;
-  base_tm.tm_sec = 0;
-  base_tm.tm_isdst = -1;
-  base_epoch = mktime(&base_tm);
-
-  target_tm.tm_year = year - 1900;
-  target_tm.tm_mon = month - 1;
-  target_tm.tm_mday = day;
-  target_tm.tm_hour = 12;
-  target_tm.tm_min = 0;
-  target_tm.tm_sec = 0;
-  target_tm.tm_isdst = -1;
-  target_epoch = mktime(&target_tm);
-
-  days_diff = (int)floor(difftime(target_epoch, base_epoch) / 86400.0 + 0.5);
-  row_index_h = 2 + days_diff;
-
-  if (row_index_h < 2) {
-    fprintf(stderr, "Error: Date %s is before base date 20251001\n", argv[1]);
-    return 1;
-  }
-
-  setenv("TZ", "Europe/Rome", 1);
   tzset();
 
-  start_tm.tm_year = year - 1900;
-  start_tm.tm_mon = month - 1;
-  start_tm.tm_mday = 1;
-  start_tm.tm_hour = 0;
-  start_tm.tm_min = 0;
-  start_tm.tm_sec = 0;
-  start_tm.tm_isdst = -1;
-
-  sds = mktime(&start_tm);
-
-  next_tm = start_tm;
-  if (month == 12) {
-    next_tm.tm_year += 1;
-    next_tm.tm_mon = 0;
-  } else {
-    next_tm.tm_mon += 1;
+  if (!parse_date(argv[1],&year,&month,&day,&target_noon)) {
+    fprintf(stderr,"Error: parameter must be a valid date in YYYYMMDD format\n");
+    return 1;
   }
-  next_tm.tm_isdst = -1;
-
-  sde = mktime(&next_tm) - 1;
-
-  conn = mysql_init(NULL);
-  if (conn == NULL) {
-    fprintf(stderr, "Error: mysql_init failed\n");
+  if (strcmp(argv[1],BASE_DATE)<0) {
+    fprintf(stderr,"Error: date %s is before base date %s\n",argv[1],BASE_DATE);
     return 1;
   }
 
-  if (mysql_real_connect(conn, "localhost", USER, PASSWORD, DB, 0, NULL, 0) == NULL) {
-    fprintf(stderr, "MySQL connection error: %s\n", mysql_error(conn));
+  n=snprintf(aaaamm,sizeof(aaaamm),"%04d%02d",year,month);
+  if (n<0 || n>=(int)sizeof(aaaamm)) {
+    return 1;
+  }
+  n=snprintf(date_str,sizeof(date_str),"%04d-%02d-%02d",year,month,day);
+  if (n<0 || n>=(int)sizeof(date_str)) {
+    return 1;
+  }
+
+  delta_months=(year-2025)*12+(month-10);
+  row_pun=2+delta_months;
+
+  base_tm.tm_year=2025-1900;
+  base_tm.tm_mon=10-1;
+  base_tm.tm_mday=1;
+  base_tm.tm_hour=12;
+  base_tm.tm_isdst=-1;
+  base_noon=mktime(&base_tm);
+  if (base_noon==(time_t)-1) {
+    fprintf(stderr,"Error: unable to calculate base date\n");
+    return 1;
+  }
+  days_diff=(int)(difftime(target_noon,base_noon)/86400.0+0.5);
+  row_h=2+days_diff;
+
+  if (!month_range(year,month,&sds,&sde)) {
+    fprintf(stderr,"Error: unable to calculate month range\n");
+    return 1;
+  }
+
+  if (!energy_config_load(&cfg,ENERGY_CONFIG_FILE,cfg_err,sizeof(cfg_err))) {
+    fprintf(stderr,"Energy config error: %s\n",cfg_err);
+    return 1;
+  }
+
+  conn=mysql_init(NULL);
+  if (conn==NULL) {
+    fprintf(stderr,"Error: mysql_init failed\n");
+    return 1;
+  }
+  if (mysql_real_connect(conn,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
+    fprintf(stderr,"MySQL connection error: %s\n",mysql_error(conn));
     mysql_close(conn);
     return 1;
   }
 
-  snprintf(query, sizeof(query),
-    "SELECT epoch, c FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch ASC",
-    (long)sds, (long)sde);
-
-  if (mysql_query(conn, query) != 0) {
-    fprintf(stderr, "MySQL query error: %s\n", mysql_error(conn));
+  n=snprintf(query,sizeof(query),
+      "SELECT epoch,c FROM pun_15m WHERE epoch BETWEEN %ld AND %ld ORDER BY epoch",
+      (long)sds,(long)sde);
+  if (n<0 || n>=(int)sizeof(query) || mysql_query(conn,query)!=0) {
+    fprintf(stderr,"MySQL query error: %s\n",mysql_error(conn));
     mysql_close(conn);
     return 1;
   }
 
-  result = mysql_store_result(conn);
-  if (result == NULL) {
-    fprintf(stderr, "MySQL store result error: %s\n", mysql_error(conn));
+  result=mysql_use_result(conn);
+  if (result==NULL) {
+    fprintf(stderr,"MySQL result error: %s\n",mysql_error(conn));
     mysql_close(conn);
     return 1;
   }
 
-  for (row = mysql_fetch_row(result); row != NULL; row = mysql_fetch_row(result)) {
-    if (row[0] == NULL || row[1] == NULL) {
+  for (row=mysql_fetch_row(result);row!=NULL;row=mysql_fetch_row(result)) {
+    if (row[0]==NULL || row[1]==NULL) {
+      continue;
+    }
+    if (!parse_db_epoch(row[0],&t_val) || !parse_db_double(row[1],&c_val)) {
+      fprintf(stderr,"Error: invalid database value\n");
+      mysql_free_result(result);
+      mysql_close(conn);
+      return 1;
+    }
+
+    local_ptr=localtime(&t_val);
+    if (local_ptr==NULL) {
+      fprintf(stderr,"Error: localtime conversion failed\n");
+      mysql_free_result(result);
+      mysql_close(conn);
+      return 1;
+    }
+    local_tm=*local_ptr;
+    d=local_tm.tm_mday;
+    if (d<1 || d>31) {
       continue;
     }
 
-    epoch_val = atoll(row[0]);
-    c_val = atof(row[1]);
-
-    t_val = (time_t)epoch_val;
-    localtime_r(&t_val, &local_tm);
-
-    band = get_band_index(&local_tm);
-
-    if (c_val < global_min) {
-      global_min = c_val;
-    }
-    if (c_val > global_max) {
-      global_max = c_val;
-    }
-
-    if (total_records < MAX_RECORDS) {
-      records[total_records].epoch = t_val;
-      records[total_records].price = c_val;
-      records[total_records].day = local_tm.tm_mday;
-      records[total_records].month = local_tm.tm_mon + 1;
-      records[total_records].year = local_tm.tm_year + 1900;
-      records[total_records].band = band;
-      total_records++;
-    }
-
-    sums[0] += c_val;
+    band=get_band_index(&local_tm);
+    sums[0]+=c_val;
     counts[0]++;
-
-    sums[band] += c_val;
+    sums[band]+=c_val;
     counts[band]++;
+    day_sums[d]+=c_val;
+    day_counts[d]++;
+
+    if (c_val>global_max) {
+      global_max=c_val;
+    }
+    if (c_val<global_min-MIN_EPSILON) {
+      global_min=c_val;
+      memset(max_min_run,0,sizeof(max_min_run));
+      run_day=d;
+      run_len=1;
+      prev_min_epoch=t_val;
+      max_min_run[d]=1;
+    } else if (fabs(c_val-global_min)<MIN_EPSILON) {
+      if (run_day==d && t_val==prev_min_epoch+900) {
+        run_len++;
+      } else {
+        run_day=d;
+        run_len=1;
+      }
+      prev_min_epoch=t_val;
+      if (run_len>max_min_run[d]) {
+        max_min_run[d]=run_len;
+      }
+    } else {
+      run_day=0;
+      run_len=0;
+      prev_min_epoch=0;
+    }
+
+    if (d==day) {
+      if (day_count>=DAY_SLOTS_MAX) {
+        fprintf(stderr,"Error: more than %d records found for target day\n",DAY_SLOTS_MAX);
+        mysql_free_result(result);
+        mysql_close(conn);
+        return 1;
+      }
+      day_prices[day_count]=c_val;
+      day_epochs[day_count]=t_val;
+      day_count++;
+    }
   }
 
+  if (mysql_errno(conn)!=0) {
+    fprintf(stderr,"MySQL fetch error: %s\n",mysql_error(conn));
+    mysql_free_result(result);
+    mysql_close(conn);
+    return 1;
+  }
   mysql_free_result(result);
   mysql_close(conn);
+  conn=NULL;
 
-  if (counts[0] == 0) {
-    fprintf(stderr, "Error: No data found for period %s\n", argv[1]);
+  if (counts[0]==0) {
+    fprintf(stderr,"Error: no data found for month %s\n",aaaamm);
+    return 1;
+  }
+  if (day_count<WINDOW_SLOTS ||
+      !find_min_window(day_prices,day_epochs,day_count,&best_window_idx,&min_window_avg)) {
+    fprintf(stderr,"Error: target day %s has no complete 3-hour window\n",date_str);
     return 1;
   }
 
-  f0 = counts[0] > 0 ? sums[0] / counts[0] : 0.0;
-  f1 = counts[1] > 0 ? sums[1] / counts[1] : 0.0;
-  f2 = counts[2] > 0 ? sums[2] / counts[2] : 0.0;
-  f3 = counts[3] > 0 ? sums[3] / counts[3] : 0.0;
+  f0=sums[0]/(double)counts[0];
+  f1=counts[1]>0 ? sums[1]/(double)counts[1] : 0.0;
+  f2=counts[2]>0 ? sums[2]/(double)counts[2] : 0.0;
+  f3=counts[3]>0 ? sums[3]/(double)counts[3] : 0.0;
 
-  for (i = 0; i < total_records; i++) {
-    d = records[i].day;
-    if (d >= 1 && d <= 31) {
-      day_sums[d] += records[i].price;
-      day_counts[d]++;
+  for (d=1;d<=31;d++) {
+    if (day_counts[d]==0) {
+      continue;
+    }
+    avg=day_sums[d]/(double)day_counts[d];
+    if (best_day==0 || avg<min_day_avg) {
+      min_day_avg=avg;
+      best_day=d;
+    }
+    if (worst_day==0 || avg>max_day_avg) {
+      max_day_avg=avg;
+      worst_day=d;
+    }
+    if (max_min_run[d]>max_run) {
+      max_run=max_min_run[d];
+      min_day=d;
     }
   }
 
-  for (d = 1; d <= 31; d++) {
-    if (day_counts[d] > 0) {
-      avg = day_sums[d] / day_counts[d];
-      if (avg < min_day_avg) {
-        min_day_avg = avg;
-        best_day = d;
-      }
-      if (avg > max_day_avg) {
-        max_day_avg = avg;
-        worst_day = d;
-      }
-    }
-  }
-
-  for (d = 1; d <= 31; d++) {
-    current_run = 0;
-    max_run = 0;
-    for (i = 0; i < total_records; i++) {
-      if (records[i].day == d) {
-        if (fabs(records[i].price - global_min) < 0.00001) {
-          current_run++;
-          if (current_run > max_run) {
-            max_run = current_run;
-          }
-        } else {
-          current_run = 0;
-        }
-      }
-    }
-    max_consecutive_per_day[d] = max_run;
-  }
-
-  min_day = best_day;
-
-  for (d = 1; d <= 31; d++) {
-    if (day_counts[d] > 0) {
-      if (max_consecutive_per_day[d] > max_consec_run) {
-        max_consec_run = max_consecutive_per_day[d];
-        min_day = d;
-      }
-    }
-  }
-
-  snprintf(bestday_str, sizeof(bestday_str), "%04d-%02d-%02d", year, month, best_day);
-  snprintf(worstday_str, sizeof(worstday_str), "%04d-%02d-%02d", year, month, worst_day);
-  snprintf(minday_str, sizeof(minday_str), "%04d-%02d-%02d", year, month, min_day);
-
-  day_records_count = 0;
-  for (i = 0; i < total_records; i++) {
-    if (records[i].day == day) {
-      if (day_records_count < 96) {
-        day_prices[day_records_count] = records[i].price;
-        day_epochs[day_records_count] = records[i].epoch;
-        day_records_count++;
-      }
-    }
-  }
-
-  best_window_idx = 0;
-  min_window_sum = DBL_MAX;
-
-  if (day_records_count >= WINDOW_SLOTS) {
-    for (i = 0; i <= day_records_count - WINDOW_SLOTS; i++) {
-      window_sum = 0.0;
-      for (k = 0; k < WINDOW_SLOTS; k++) {
-        window_sum += day_prices[i + k];
-      }
-      if (window_sum < min_window_sum) {
-        min_window_sum = window_sum;
-        best_window_idx = i;
-      }
-    }
-    min_window_avg = min_window_sum / (double)WINDOW_SLOTS;
-    localtime_r(&day_epochs[best_window_idx], &local_tm);
-    snprintf(time_str, sizeof(time_str), "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
-  } else {
-    snprintf(time_str, sizeof(time_str), "00:00");
-    min_window_avg = 0.0;
-  }
-
-  if (!read_access_token(access_token, sizeof(access_token))) {
+  n=snprintf(bestday,sizeof(bestday),"%04d-%02d-%02d",year,month,best_day);
+  n|=snprintf(worstday,sizeof(worstday),"%04d-%02d-%02d",year,month,worst_day);
+  n|=snprintf(minday,sizeof(minday),"%04d-%02d-%02d",year,month,min_day);
+  if (n<0) {
     return 1;
   }
 
-  if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
-    fprintf(stderr, "Error: curl_global_init failed\n");
+  local_ptr=localtime(&day_epochs[best_window_idx]);
+  if (local_ptr==NULL) {
+    fprintf(stderr,"Error: localtime conversion failed\n");
+    return 1;
+  }
+  n=snprintf(time_str,sizeof(time_str),"%02d:%02d",local_ptr->tm_hour,local_ptr->tm_min);
+  if (n<0 || n>=(int)sizeof(time_str)) {
     return 1;
   }
 
-  // Resolving sheet IDs dynamically
-  sheet_id_pun = get_sheet_id_by_name(access_token, SHEET_NAME_PUN);
-  sheet_id_h = get_sheet_id_by_name(access_token, SHEET_NAME_H);
-
-  if (sheet_id_pun == -1 || sheet_id_h == -1) {
-    fprintf(stderr, "Error: failed to resolve sheet IDs from names\n");
+  if (!read_access_token(token,sizeof(token))) {
+    return 1;
+  }
+  if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) {
+    fprintf(stderr,"Error: curl_global_init failed\n");
+    return 1;
+  }
+  if (!mem_init(&body)) {
+    fprintf(stderr,"Error: memory allocation failed\n");
     curl_global_cleanup();
     return 1;
   }
 
-  // STEP 1: Sort sheets ASCENDING
-  if (!sort_google_sheet_range(access_token, sheet_id_pun, 10, 1) ||
-      !sort_google_sheet_range(access_token, sheet_id_h, 3, 1)) {
-    fprintf(stderr, "Error: failed to sort sheets ASCENDING\n");
-    curl_global_cleanup();
-    return 1;
+  curl=curl_easy_init();
+  if (curl==NULL) {
+    fprintf(stderr,"Error: curl_easy_init failed\n");
+    goto cleanup;
   }
 
-  // STEP 2: Write target rows
-  if (!update_google_sheet_pun(access_token, aaaamm, row_index_pun,
-                               f0, f1, f2, f3,
-                               global_min, global_max,
-                               bestday_str, worstday_str, minday_str)) {
-    fprintf(stderr, "Error: failed to update Google Sheet tab pun\n");
-    curl_global_cleanup();
-    return 1;
+  n=snprintf(auth_header,sizeof(auth_header),"Authorization: Bearer %s",token);
+  if (n<0 || n>=(int)sizeof(auth_header)) {
+    fprintf(stderr,"Error: access token too long\n");
+    goto cleanup;
+  }
+  headers=curl_slist_append(NULL,"Content-Type: application/json");
+  if (headers==NULL) {
+    fprintf(stderr,"Error: curl header allocation failed\n");
+    goto cleanup;
+  }
+  tmp_headers=curl_slist_append(headers,auth_header);
+  if (tmp_headers==NULL) {
+    fprintf(stderr,"Error: curl header allocation failed\n");
+    goto cleanup;
+  }
+  headers=tmp_headers;
+  tmp_headers=NULL;
+
+  if (!get_sheet_ids(curl,headers,&body,&sheet_id_pun,&sheet_id_h)) {
+    goto cleanup;
+  }
+  if (!sort_google_sheets(curl,headers,&body,sheet_id_pun,sheet_id_h,1)) {
+    fprintf(stderr,"Error: failed to sort sheets ascending\n");
+    goto cleanup;
+  }
+  sorted_ascending=1;
+
+  if (!update_google_sheets(curl,headers,&body,row_pun,row_h,aaaamm,
+      f0,f1,f2,f3,global_min,global_max,bestday,worstday,minday,
+      date_str,time_str,min_window_avg)) {
+    fprintf(stderr,"Error: failed to update Google Sheets\n");
+    goto cleanup;
   }
 
-  if (!update_google_sheet_h(access_token, row_index_h,
-                             date_str, time_str, min_window_avg)) {
-    fprintf(stderr, "Error: failed to update Google Sheet tab h\n");
-    curl_global_cleanup();
-    return 1;
+  if (!sort_google_sheets(curl,headers,&body,sheet_id_pun,sheet_id_h,0)) {
+    fprintf(stderr,"Error: failed to sort sheets descending\n");
+    goto cleanup;
   }
+  sorted_ascending=0;
 
-  // STEP 3: Sort sheets DESCENDING
-  if (!sort_google_sheet_range(access_token, sheet_id_pun, 10, 0) ||
-      !sort_google_sheet_range(access_token, sheet_id_h, 3, 0)) {
-    fprintf(stderr, "Error: failed to sort sheets DESCENDING\n");
-    curl_global_cleanup();
-    return 1;
-  }
-
-  printf("OK: Updated Sheet 'pun' row %d for month %s\n", row_index_pun, aaaamm);
-  printf("F0: %.5f | F1: %.5f | F2: %.5f | F3: %.5f\n", f0, f1, f2, f3);
+  printf("OK: Updated Sheet '%s' row %d for month %s\n",SHEET_NAME_PUN,row_pun,aaaamm);
+  printf("F0: %.5f | F1: %.5f | F2: %.5f | F3: %.5f\n",f0,f1,f2,f3);
   printf("MIN: %.5f | MAX: %.5f | BESTDAY: %s | WORSTDAY: %s | MINDAY: %s\n",
-         global_min, global_max, bestday_str, worstday_str, minday_str);
-  printf("OK: Updated Sheet 'h' row %d for date %s -> Start: %s | 3h Avg: %.5f €/MWh\n",
-         row_index_h, date_str, time_str, min_window_avg);
+      global_min,global_max,bestday,worstday,minday);
+  printf("OK: Updated Sheet '%s' row %d for date %s -> Start: %s | 3h Avg: %.5f EUR/MWh\n",
+      SHEET_NAME_H,row_h,date_str,time_str,min_window_avg);
+  status=0;
 
+cleanup:
+  if (sorted_ascending && curl!=NULL && sheet_id_pun>=0 && sheet_id_h>=0) {
+    if (!sort_google_sheets(curl,headers,&body,sheet_id_pun,sheet_id_h,0)) {
+      fprintf(stderr,"Warning: unable to restore descending sheet order\n");
+    }
+  }
+  curl_slist_free_all(headers);
+  if (curl!=NULL) {
+    curl_easy_cleanup(curl);
+  }
+  mem_free(&body);
   curl_global_cleanup();
-  return 0;
+  return status;
 }
